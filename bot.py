@@ -1318,10 +1318,13 @@ async def render_and_screenshot_chart(
     period_label = compute_period_label(period, rng_text)
     await notify(f"🏷 Chart header well: {chart_well_name} | Estimated period: {period_label}")
 
-    # Toggle PIP and PD visibility (this redraws the Y-axes and shifts _chartArea's left offset/width)
+    # Toggle PIP and PD visibility
     await set_tag_visibility_on_chart(page, PIP_TAG_SEL, "PIP (Press-Pump Intake)", remove_pip, notify)
     await set_tag_visibility_on_chart(page, PD_TAG_SEL, "PD (Press-Pump Discharge)", remove_pd, notify)
-    await asyncio.sleep(2.0)
+    
+    # Give Highcharts ample time to finish redrawing axes and re-attaching tracker paths after a toggle
+    await notify("⏳ Waiting for chart layout to stabilize after curve toggle...")
+    await asyncio.sleep(5.0)
 
     # Re-fetch chart_area AFTER toggling tags so place_points and screenshot use the fresh DOM element
     _, fresh_chart_area = await find_in_frames(page, CHART_SEL, timeout=20, need_size=True)
