@@ -80,6 +80,9 @@ GRID_PARAMS = [
 # max seconds per model attempt (keeps total AI time well under 2 minutes)
 GEMINI_MODEL_TIMEOUT_SEC = 60
 
+# Well search retries (verifies via breadcrumb li.current a)
+MAX_SEARCH_ATTEMPTS = 3
+
 # Browser size (a narrower tab gives a narrower chart)
 VIEWPORT_W = 1500
 VIEWPORT_H = 732
@@ -251,7 +254,7 @@ async def ask_text(bot, chat_id, prompt, pattern, delete=False, timeout=USER_REP
 
 
 # =====================================================================================
-# Pickers: view, period (presets / custom range), PD visibility, parameters to mark
+# Pickers: view, period (presets / custom range), PD/PIP visibility, parameters to mark
 # =====================================================================================
 PRESETS = ["1 D", "3 D", "1 W", "2 W", "1 M", "2 M", "1 Y"]
 
@@ -432,7 +435,7 @@ async def pick_single_param_to_mark(bot, chat_id, available):
 def load_accounts():
     if not os.path.exists(CREDENTIALS_FILE):
         raise Exception(
-            f"{CREDENTIALS_FILE} not found. Set CREDENTIALS_JSON in Render Environment Variables: "
+            f"{CREDENTIALS_FILE} not found. Set CREDENTIALS_JSON in Environment Variables: "
             '{"accounts": [{"name": "...", "email": "...", "password": "..."}]}'
         )
     with open(CREDENTIALS_FILE, "r", encoding="utf-8") as f:
@@ -657,7 +660,7 @@ async def ensure_logged_in(page, ui, notify):
 
 
 # =====================================================================================
-# Page helpers
+# Page helpers & Verified Well Search (with Breadcrumb Confirmation)
 # =====================================================================================
 async def find_in_frames(page, selector, timeout=60, need_size=False):
     """Poll every frame (including nested ones) until `selector` exists. Returns (frame, element)."""
@@ -695,6 +698,90 @@ async def click(el):
 
 async def js_click(el):
     await el.evaluate("e => e.click()")
+
+
+def clean_well_name(well_name: str) -> str:
+    """Strips leading/trailing whitespace and any trailing periods or spaces from a well name."""
+    name = str(well_name or "").strip()
+    while name and name[-1] in (" ", "."):
+        name = name[:-1].rstrip()
+    return re.sub(r"^(?:ESP_|HPUMP_)", "", name, flags=re.I).strip()
+
+
+def get_well_prefix(well_name: str) -> str:
+    """Returns 'HPUMP_' if the name contains 'HPS', 'SHAHD', or 'ZAHRAA' (case-insensitive), otherwise 'ESP_'."""
+    upper_name = well_name.upper()
+    if "HPS" in upper_name or "SHAHD" in upper_name or "ZAHRAA" in upper_name:
+        return "HPUMP_"
+    return "ESP_"
+
+
+async def get_current_well_name(page):
+    """Reads the breadcrumb (<li class="current"><a>ESP_WellName</a></li>) across frames
+    to find out which well is actually open right now."""
+    for fr in page.frames:
+        try:
+            for el in await fr.query_selector_all("li.current a"):
+                txt = re.sub(r"\s+", " ", (await el.inner_text()) or "").strip()
+                if txt and ("ESP_" in txt.upper() or "HPUMP_" in txt.upper()):
+                    return txt
+        except Exception:
+            pass
+    # Fallback: return any non-empty li.current a text
+    for fr in page.frames:
+        try:
+            el = await fr.query_selector("li.current a")
+            if el:
+                txt = re.sub(r"\s+", " ", (await el.inner_text()) or "").strip()
+                if txt:
+                    return txt
+        except Exception:
+            pass
+    return None
+
+
+async def close_search_box(page, frame=None):
+    """Attempts to close/reset the search box via 'span.deleteiconAsset span' if visible."""
+    frames_to_check = [frame] if frame else page.frames
+    for fr in frames_to_check:
+        if not fr:
+            continue
+        try:
+            clear_icon = await fr.query_selector("span.deleteiconAsset span")
+            if clear_icon and await clear_icon.is_visible():
+                await click(clear_icon)
+                await asyncio.sleep(0.5)
+        except Exception:
+            pass
+
+
+async def open_search_box(page, frame):
+    """Ensures the search input box (#assetSearchText) is open and returns it."""
+    try:
+        existing = await frame.query_selector("#assetSearchText")
+        if existing and await existing.is_visible():
+            return existing
+    except Exception:
+        pass
+
+    search_icon = await frame.query_selector("#assetSearch")
+    if not search_icon:
+        frame, search_icon = await find_in_frames(page, "#assetSearch", timeout=20)
+    if not search_icon:
+        raise Exception("Search icon (#assetSearch) not found.")
+
+    try:
+        await search_icon.click(timeout=3000)
+    except Exception:
+        await js_click(search_icon)
+
+    await asyncio.sleep(0.8)
+    search_input = await frame.query_selector("#assetSearchText")
+    if not search_input:
+        _, search_input = await find_in_frames(page, "#assetSearchText", timeout=15, need_size=True)
+    if not search_input:
+        raise Exception("Search input (#assetSearchText) not found.")
+    return search_input
 
 
 async def click_well_result(page, search_term):
@@ -769,52 +856,93 @@ async def ensure_tab_open(page, selector, name, notify, timeout=40, required=Tru
 
 
 async def open_well(well_name, page, notify, login_ui):
-    """Open the site, log in if needed, search the well and select it."""
-    await notify("🌐 Opening ProductionLink...")
-    await page.goto(SITE_URL, wait_until="domcontentloaded")
-    await ensure_logged_in(page, login_ui, notify)
+    """Open ProductionLink (if not already open), search for the well, and verify via the
+    breadcrumb (`li.current a`) that the requested well is confirmed open (up to MAX_SEARCH_ATTEMPTS)."""
+    if not await logged_in(page):
+        await notify("🌐 Opening ProductionLink...")
+        await page.goto(SITE_URL, wait_until="domcontentloaded")
+        await ensure_logged_in(page, login_ui, notify)
 
     frame, search_icon = await find_in_frames(page, "#assetSearch", timeout=90)
     if not search_icon:
         raise Exception("Search icon (#assetSearch) not found in any frame.\n" + frames_report(page))
-    await notify("🔍 Search icon found")
 
-    clear_icon = await frame.query_selector("span.deleteiconAsset span")
-    if clear_icon:
+    cleaned_name = clean_well_name(well_name)
+    upper_name = cleaned_name.upper()
+    prefix = get_well_prefix(cleaned_name)
+    expected_well = f"{prefix}{cleaned_name}"
+
+    # Check if the requested well is already open via the breadcrumb
+    already_open = await get_current_well_name(page)
+    if already_open and already_open.strip().upper() == expected_well.strip().upper():
+        await notify(f"✅ Well '{already_open}' is already confirmed open.")
+        return expected_well, upper_name, "already_open"
+
+    last_error = None
+    last_seen_well = None
+    clicked = None
+
+    for attempt in range(1, MAX_SEARCH_ATTEMPTS + 1):
         try:
-            await js_click(clear_icon)
-            await asyncio.sleep(1)
-        except Exception:
-            pass
+            await notify(f"🔍 Searching '{expected_well}' (attempt {attempt}/{MAX_SEARCH_ATTEMPTS})...")
+            await close_search_box(page, frame)
+            await asyncio.sleep(0.3)
 
-    await js_click(search_icon)
-    await asyncio.sleep(1)
-    search_input = await frame.query_selector("#assetSearchText")
-    if not search_input:
-        _, search_input = await find_in_frames(page, "#assetSearchText", timeout=15)
-    if not search_input:
-        raise Exception("Search input (#assetSearchText) not found.\n" + frames_report(page))
+            search_input = await open_search_box(page, frame)
+            await click(search_input)
+            await asyncio.sleep(0.3)
+            await search_input.evaluate("el => { el.value = ''; el.focus(); }")
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Delete")
+            await page.keyboard.type(expected_well, delay=70)
+            await asyncio.sleep(2.0)
 
-    upper_name = well_name.upper().strip()
-    prefix = "HPUMP_" if ("SHAHD" in upper_name or "ZAHRAA" in upper_name) else "ESP_"
-    search_term = f"{prefix}{upper_name}"
+            clicked = await click_well_result(page, expected_well)
+            await page.keyboard.press("Enter")
+            await asyncio.sleep(3.0)
+            if not clicked:
+                clicked = await click_well_result(page, expected_well)
 
-    await notify(f"⌨️ Typing well name: {search_term}")
-    await search_input.evaluate("el => { el.value = ''; el.focus(); }")
-    await page.keyboard.type(search_term, delay=80)
-    await asyncio.sleep(3)
+            # Wait for #productionEventLink (or breadcrumb) to confirm the well view loaded
+            await find_in_frames(page, "#productionEventLink, li.current a", timeout=20)
 
-    clicked = await click_well_result(page, search_term)
-    if not clicked:
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(3)
-        clicked = await click_well_result(page, search_term)
-    await notify("🖱️ Well selected from the search results" if clicked else "↩️ Pressed Enter to search")
-    return search_term, upper_name, clicked
+            # Poll breadcrumb up to 8 seconds in case the DOM updates slightly after Enter
+            current_well = None
+            for _ in range(8):
+                current_well = await get_current_well_name(page)
+                last_seen_well = current_well
+                if current_well and current_well.strip().upper() == expected_well.strip().upper():
+                    break
+                await asyncio.sleep(1.0)
+
+            if current_well and current_well.strip().upper() == expected_well.strip().upper():
+                await notify(f"✅ Confirmed well open via breadcrumb: '{current_well}' (attempt {attempt})")
+                await close_search_box(page, frame)
+                return expected_well, upper_name, clicked or "enter_confirmed"
+
+            await notify(
+                f"⚠️ Attempt {attempt} mismatch — expected '{expected_well}', breadcrumb shows '{current_well}'."
+            )
+
+        except Exception as e:
+            last_error = e
+            await notify(f"⚠️ Search attempt {attempt} error: {str(e)[:120]}")
+
+        await close_search_box(page, frame)
+        await asyncio.sleep(1.0)
+
+    if last_error is not None:
+        raise Exception(
+            f"Could not open well '{expected_well}' after {MAX_SEARCH_ATTEMPTS} attempts. Last error: {last_error}"
+        )
+    raise Exception(
+        f"Could not open well '{expected_well}' after {MAX_SEARCH_ATTEMPTS} attempts. "
+        f"Last well seen open was: '{last_seen_well}'."
+    )
 
 
 # =====================================================================================
-# Trends: chart well title, period estimation (in hours / hours and half), PD toggle
+# Trends: chart well title, period estimation ("Last Day" for 1 D, or hours), PD/PIP toggle
 # =====================================================================================
 async def get_chart_well_name(page, fallback=""):
     """Read the well name from <div id='Gauge_...chartHeader_Title' class='chart-header-title'>FAJR-48</div>."""
@@ -827,6 +955,9 @@ async def get_chart_well_name(page, fallback=""):
                     return re.sub(r"^(?:ESP_|HPUMP_)", "", t, flags=re.I).strip()
         except Exception:
             pass
+    bc = await get_current_well_name(page)
+    if bc:
+        return re.sub(r"^(?:ESP_|HPUMP_)", "", bc, flags=re.I).strip()
     return re.sub(r"^(?:ESP_|HPUMP_)", "", (fallback or "").strip(), flags=re.I)
 
 
@@ -877,7 +1008,16 @@ def _format_hours_half(total_hours: float) -> str:
 
 
 def compute_period_label(period: dict, range_text: str = "") -> str:
-    """Estimate the chart period in hours (rounded to 0.5h) and return 'Last X Hours' / 'Last X.5 Hours'."""
+    """Return 'Last Day' whenever the user chose the '1 D' preset (even if > 24h),
+    otherwise estimate the period in hours (rounded to 0.5h)."""
+    if period and period.get("type") == "preset":
+        key = re.sub(r"\s+", "", period.get("label", "")).upper()
+        if key == "1D":
+            return "Last Day"
+
+    if period and period.get("type") == "default":
+        return "Last Day"
+
     if range_text:
         clean_rng = re.sub(r"\(.*?\)", "", range_text).strip()
         parts = [p.strip() for p in re.split(r"\s+-\s+|\s+to\s+", clean_rng) if p.strip()]
@@ -893,7 +1033,6 @@ def compute_period_label(period: dict, range_text: str = "") -> str:
             return _format_hours_half(hours)
 
     preset_hours = {
-        "1D": 24,
         "3D": 72,
         "1W": 168,
         "2W": 336,
@@ -906,12 +1045,11 @@ def compute_period_label(period: dict, range_text: str = "") -> str:
         if key in preset_hours:
             return _format_hours_half(preset_hours[key])
 
-    return "Last 24 Hours"
+    return "Last Day"
 
 
 async def set_tag_visibility_on_chart(page, selector: str, label: str, remove_tag: bool, notify):
     """Ensure a chart tag (e.g. PIP or PD) is hidden (if remove_tag=True) or visible (if remove_tag=False)."""
-    # First, close any active freeze points so ProductionLink doesn't block legend clicks
     for fr in page.frames:
         try:
             await fr.evaluate("""() => {
@@ -924,7 +1062,6 @@ async def set_tag_visibility_on_chart(page, selector: str, label: str, remove_ta
     await asyncio.sleep(0.4)
 
     async def check_tag_state():
-        """Re-find the tag container fresh each time and check if it is grayed out (204, 204, 204)."""
         _, tag_el = await find_in_frames(page, selector, timeout=10, need_size=True)
         if not tag_el:
             return None, False
@@ -973,7 +1110,6 @@ async def set_tag_visibility_on_chart(page, selector: str, label: str, remove_ta
                 if (sp) sp.click();
             }""")
 
-        # Wait for Highcharts & Y-axes to redraw after toggling the series
         await asyncio.sleep(3.5)
 
         _, currently_hidden = await check_tag_state()
@@ -986,7 +1122,7 @@ async def set_tag_visibility_on_chart(page, selector: str, label: str, remove_ta
         await notify(f"✅ {label} {'removed from' if want_hidden else 'restored on'} the chart.")
     else:
         await notify(f"⚠️ {label} tag was clicked, but its color did not change as expected.")
-        
+
 
 async def find_preset_button(page, label, timeout=20):
     """The span.defaultFilter whose text is the label ('1 D', '3 D', ...; the page uses &nbsp;)."""
@@ -1122,7 +1258,8 @@ async def place_points(page, chart_area, notify):
     curve_targets = await plot_el.evaluate("""(el, {leftMargin, rightMargin}) => {
         const w = el.clientWidth || el.getBoundingClientRect().width;
         const h = el.clientHeight || el.getBoundingClientRect().height;
-        const plotOffsetLeft = parseFloat(el.style.left) || 311;
+        const plotOffsetLeft = parseFloat(el.style.left) || getComputedStyle(el).left || 311;
+        const parsedLeft = parseFloat(plotOffsetLeft) || 0;
 
         const paths = [...el.querySelectorAll('path.highcharts-tracker')];
         const leftCandidates = [];
@@ -1156,7 +1293,7 @@ async def place_points(page, chart_area, notify):
         return {
             w: w,
             h: h,
-            plotOffsetLeft: plotOffsetLeft,
+            plotOffsetLeft: parsedLeft,
             left: leftCandidates,
             right: rightCandidates
         };
@@ -1164,7 +1301,7 @@ async def place_points(page, chart_area, notify):
 
     plot_w = curve_targets.get("w") or box["width"]
     plot_h = curve_targets.get("h") or box["height"]
-    plot_left_css = curve_targets.get("plotOffsetLeft") or 311.0
+    plot_left_css = curve_targets.get("plotOffsetLeft") or 0.0
 
     left_max_css = plot_left_css + (plot_w * 0.25)
     right_min_css = plot_left_css + (plot_w * 0.75)
@@ -1213,7 +1350,7 @@ async def place_points(page, chart_area, notify):
         await asyncio.sleep(POINT_WAIT_SEC)
 
     await notify(
-        f"📍 Placing 2 points inside _chartArea (width {plot_w:.0f}x{plot_h:.0f}px)..."
+        f"📍 Placing 2 points inside _chartArea (width {plot_w:.0f}x{plot_h:.0f}px, offsetLeft={plot_left_css:.0f}px)..."
     )
 
     left_pts = curve_targets.get("left") or [{"x": float(START_CLICK_FROM_LEFT_PX), "y": plot_h * POINT_Y_FRAC}]
@@ -1286,13 +1423,13 @@ async def render_and_screenshot_chart(
     remove_pd=False,
     apply_dates=True,
 ):
-    """Apply period, toggle PIP/PD, wait for stabilization, and place a fresh set of 2 freeze points."""
+    """Apply `period`, toggle PIP/PD, wait for stabilization, and place a fresh set of 2 freeze points."""
     if reload_tab:
         await notify(f"🔃 Reloading Trends tab (with +{extra_wait}s extra wait)...")
         _, tab = await find_in_frames(page, TRENDS_TAB, timeout=15)
         if tab:
             await click(tab)
-            await asyncio.sleep(6 + extra_wait)
+            await asyncio.sleep(10 + extra_wait)
         apply_dates = True
 
     _, chart_area = await find_in_frames(page, CHART_SEL, timeout=75, need_size=True)
@@ -1307,35 +1444,31 @@ async def render_and_screenshot_chart(
                 await asyncio.sleep(extra_wait)
             _, new_area = await find_in_frames(page, CHART_SEL, timeout=30, need_size=True)
             chart_area = new_area or chart_area
+
+        curve_wait = 6 + extra_wait
+        await notify(f"📈 Waiting {curve_wait}s for the curves to finish drawing...")
+        await asyncio.sleep(curve_wait)
     else:
         rng_text = await get_range_text(page)
 
     chart_well_name = await get_chart_well_name(page, fallback=search_term)
     period_label = compute_period_label(period, rng_text)
-    await notify(f"🏷 Chart header well: {chart_well_name} | Estimated period: {period_label}")
+    await notify(f"🏷 Chart header well: {chart_well_name} | Period: {period_label}")
 
-    # 1. Toggle PIP and PD visibility first
+    # Toggle PIP and PD visibility
     await set_tag_visibility_on_chart(page, PIP_TAG_SEL, "PIP (Press-Pump Intake)", remove_pip, notify)
     await set_tag_visibility_on_chart(page, PD_TAG_SEL, "PD (Press-Pump Discharge)", remove_pd, notify)
 
-    # 2. Wait for the chart layout and curves to finish drawing
-    curve_wait = 6 + extra_wait
-    await notify(f"📈 Waiting {curve_wait}s for the curves to finish drawing and stabilizing...")
-    await asyncio.sleep(curve_wait)
+    if remove_pip or remove_pd:
+        await notify("⏳ Waiting 4s for chart layout and axes to settle after curve removal...")
+        await asyncio.sleep(4.0)
 
     # Re-fetch chart_area after stabilization so place_points targets the fresh DOM element
     _, fresh_chart_area = await find_in_frames(page, CHART_SEL, timeout=20, need_size=True)
     chart_area = fresh_chart_area or chart_area
 
-    # 3. Always clear any leftover points and place a brand new set of 2 points
     if PLACE_POINTS:
         try:
-            chart_frame, _ = await find_in_frames(page, '#freezeDataContainer', timeout=5)
-            if chart_frame:
-                await chart_frame.evaluate("""() => {
-                    document.querySelectorAll('#freezeDataContainer img[id$="_close"]').forEach(b => b.click());
-                }""")
-                await asyncio.sleep(0.3)
             await place_points(page, chart_area, notify)
         except Exception as e:
             await notify(f"⚠️ Could not place the points: {str(e)[:200]} (continuing without them)")
@@ -1345,14 +1478,20 @@ async def render_and_screenshot_chart(
     await notify("📸 Chart screenshot captured")
     return chart_well_name, period_label
 
+
 async def capture_chart_advanced(
-    well_name, page, notify, out_path, login_ui, period, remove_pip=False, remove_pd=False
+    well_name, page, notify, out_path, login_ui, period, remove_pip=False, remove_pd=False, extra_wait=0
 ):
-    """Open the well for the first time, open the Trends tab, and capture the chart.
-    Returns (chart_well_name, period_label)."""
+    """Run the full Trends chart capture process from the start (confirm well via breadcrumb,
+    ensure Trends tab is open, wait for chart load, apply period, remove PIP/PD, and place 2 points)."""
     search_term, upper_name, clicked = await open_well(well_name, page, notify, login_ui)
 
-    await ensure_tab_open(page, TRENDS_TAB, "Trends tab", notify, timeout=20, required=False)
+    # Clicking Trends tab forces a clean chart reload with default dimensions before applying period & toggles
+    _, tab = await find_in_frames(page, TRENDS_TAB, timeout=20)
+    if tab:
+        await notify("📑 Opening / refreshing Trends tab...")
+        await click(tab)
+        await asyncio.sleep(4)
 
     opened = None
     for _ in range(2):
@@ -1370,20 +1509,22 @@ async def capture_chart_advanced(
             f"Elements containing '{upper_name}':\n{await dump_candidates(page, upper_name)}\n\n{frames_report(page)}"
         )
 
-    await notify("⏳ Loading well data and chart...")
-    await asyncio.sleep(14)
+    wait_load = 14 + extra_wait
+    await notify(f"⏳ Loading well data and chart ({wait_load}s)...")
+    await asyncio.sleep(wait_load)
     return await render_and_screenshot_chart(
         page,
         notify,
         out_path,
         period,
         search_term=upper_name,
-        extra_wait=0,
+        extra_wait=extra_wait,
         reload_tab=False,
         remove_pip=remove_pip,
         remove_pd=remove_pd,
         apply_dates=True,
     )
+
 
 # =====================================================================================
 # Grid View > Facility Parameters
@@ -1573,7 +1714,7 @@ def format_report_numbers(param_key: str, text: str) -> str:
     return re.sub(r"\b\d+(?:,\d{3})*\.\d+\b", _replace_num, text)
 
 
-def build_prompt(well: str, period_label: str = "Last 24 Hours", remove_pip: bool = False, remove_pd: bool = False) -> str:
+def build_prompt(well: str, period_label: str = "Last Day", remove_pip: bool = False, remove_pd: bool = False) -> str:
     pip_instruction = (
         '- "PIP" was intentionally hidden/removed by the user; set "PIP" status to "not_visible" with empty text.'
         if remove_pip
@@ -1680,7 +1821,7 @@ async def _call_gemini_fast(model: str, contents: list, json_mode: bool = False,
 
 
 async def analyze_with_ai(
-    image_path, well, period_label="Last 24 Hours", remove_pip=False, remove_pd=False, notify=None
+    image_path, well, period_label="Last Day", remove_pip=False, remove_pd=False, notify=None
 ):
     """Ask the models in order and return the parsed JSON."""
     with open(image_path, "rb") as f:
@@ -1709,6 +1850,7 @@ async def analyze_with_ai(
                 nxt = f" Trying {models[i + 1]}..." if i + 1 < len(models) else ""
                 await notify(f"⚠️ {model} failed ({short}).{nxt}")
     raise Exception("All Gemini models failed:\n" + "\n".join(errors))
+
 
 async def refine_report_with_ai(image_path, well, period_label, current_report, user_instruction, notify=None):
     """Refine the existing WhatsApp report using the chart image and the user's follow-up prompt."""
@@ -1819,6 +1961,7 @@ async def resolve_decisions(
     remove_pd=False,
     update_msg=None,
     notify=None,
+    login_ui=None,
 ):
     """Ask what to do with each parameter that is missing or 0 all along.
     Automatically excludes PIP and/or PD if the user chose to remove them."""
@@ -1880,17 +2023,16 @@ async def resolve_decisions(
         elif action == "reload":
             extra_wait += 5
             try:
-                well, period_label = await render_and_screenshot_chart(
+                well, period_label = await capture_chart_advanced(
+                    well,
                     page,
                     notify,
                     image_path,
+                    login_ui or LoginUI(bot, chat_id),
                     period,
-                    well,
-                    extra_wait=extra_wait,
-                    reload_tab=True,
                     remove_pip=remove_pip,
                     remove_pd=remove_pd,
-                    apply_dates=True,
+                    extra_wait=extra_wait,
                 )
                 with open(image_path, "rb") as photo:
                     if update_msg:
@@ -2373,11 +2515,12 @@ async def run_grid_flow(bot, chat_id, well, notify, debug_path):
 
 
 async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_path):
-    """Open Trends chart, read the true well name from the chart header, optionally remove PIP/PD,
-    estimate the period in hours (or hours and half), and analyze with Gemini."""
+    """Open Trends chart, verify well via breadcrumb, read the true well name from the chart header,
+    optionally remove PIP/PD, estimate the period ('Last Day' for 1 D, or hours), and analyze with Gemini."""
     period = await pick_period(bot, chat_id, well)
     remove_pip, remove_pd = await ask_curves_to_remove(bot, chat_id, well)
     extra_wait = 0
+    login_ui = LoginUI(bot, chat_id)
 
     async with browser_page(debug_path) as page:
         chart_well, period_label = await capture_chart_advanced(
@@ -2385,10 +2528,11 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
             page,
             notify,
             path,
-            LoginUI(bot, chat_id),
+            login_ui,
             period,
             remove_pip=remove_pip,
             remove_pd=remove_pd,
+            extra_wait=extra_wait,
         )
 
         while True:
@@ -2418,6 +2562,7 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
                 remove_pd=remove_pd,
                 update_msg=update_msg,
                 notify=notify,
+                login_ui=login_ui,
             )
             report_text = build_report(chart_well, period_label, data, decisions)
             await bot.send_message(chat_id, report_text)
@@ -2461,49 +2606,48 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
 
                 if next_action == "toggle_pip":
                     remove_pip = not remove_pip
-                    chart_well, period_label = await render_and_screenshot_chart(
+                    # Restart the full chart capture flow from the start so altered Y-axis/chart dimensions are measured fresh
+                    chart_well, period_label = await capture_chart_advanced(
+                        well,
                         page,
                         notify,
                         path,
+                        login_ui,
                         period,
-                        chart_well,
-                        extra_wait=extra_wait,
-                        reload_tab=False,
                         remove_pip=remove_pip,
                         remove_pd=remove_pd,
-                        apply_dates=False,
+                        extra_wait=extra_wait,
                     )
                     break
 
                 if next_action == "toggle_pd":
                     remove_pd = not remove_pd
-                    chart_well, period_label = await render_and_screenshot_chart(
+                    # Restart the full chart capture flow from the start so altered Y-axis/chart dimensions are measured fresh
+                    chart_well, period_label = await capture_chart_advanced(
+                        well,
                         page,
                         notify,
                         path,
+                        login_ui,
                         period,
-                        chart_well,
-                        extra_wait=extra_wait,
-                        reload_tab=False,
                         remove_pip=remove_pip,
                         remove_pd=remove_pd,
-                        apply_dates=False,
+                        extra_wait=extra_wait,
                     )
                     break
 
                 if next_action == "reload_chart":
                     extra_wait += 5
-                    chart_well, period_label = await render_and_screenshot_chart(
+                    chart_well, period_label = await capture_chart_advanced(
+                        well,
                         page,
                         notify,
                         path,
+                        login_ui,
                         period,
-                        chart_well,
-                        extra_wait=extra_wait,
-                        reload_tab=True,
                         remove_pip=remove_pip,
                         remove_pd=remove_pd,
-                        apply_dates=True,
+                        extra_wait=extra_wait,
                     )
                     break
 
@@ -2511,17 +2655,16 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
                     extra_wait = 0
                     period = await pick_period(bot, chat_id, chart_well)
                     remove_pip, remove_pd = await ask_curves_to_remove(bot, chat_id, chart_well)
-                    chart_well, period_label = await render_and_screenshot_chart(
+                    chart_well, period_label = await capture_chart_advanced(
+                        well,
                         page,
                         notify,
                         path,
+                        login_ui,
                         period,
-                        chart_well,
-                        extra_wait=0,
-                        reload_tab=False,
                         remove_pip=remove_pip,
                         remove_pd=remove_pd,
-                        apply_dates=True,
+                        extra_wait=0,
                     )
                     break
 
