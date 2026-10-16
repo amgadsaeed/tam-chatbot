@@ -1,0 +1,46 @@
+name: Run ESP Telegram Bot 24/7
+
+on:
+  workflow_dispatch: # Lets you start it manually with 1 click
+  schedule:
+    - cron: '0 */5 * * *' # Automatically restarts every 5 hours
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 310 # Runs for ~5 hours, then hands over to the next scheduled run
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies & Playwright Chromium
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Restore saved Okta browser session (if cached)
+        uses: actions/cache/restore@v4
+        with:
+          path: session_state.json
+          key: okta-session-state
+
+      - name: Run Bot (for 5 hours)
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
+          CREDENTIALS_JSON: ${{ secrets.CREDENTIALS_JSON }}
+        run: |
+          timeout 18000s python -u bot.py || true
+
+      - name: Save Okta browser session for next run
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: session_state.json
+          key: okta-session-state-${{ github.run_id }}
