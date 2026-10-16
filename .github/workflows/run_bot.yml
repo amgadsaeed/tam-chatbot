@@ -1,12 +1,15 @@
 name: Run ESP Telegram Bot 24/7
 
+concurrency:
+  group: telegram-bot-session
+  cancel-in-progress: true # Automatically kills any older running instance!
+
 on:
   workflow_dispatch:
   push:
-    branches: [ "main" ]  # Automatically triggers a fresh run whenever you push code!
+    branches: [ "main" ]
   schedule:
     - cron: '0 */5 * * *'
-
 jobs:
   run-bot:
     runs-on: ubuntu-latest
