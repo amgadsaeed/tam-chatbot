@@ -1286,7 +1286,8 @@ async def render_and_screenshot_chart(
     remove_pd=False,
     apply_dates=True,
 ):
-    """Apply `period` (if apply_dates=True), toggle PIP/PD, place the 2 points on the updated plot, and screenshot."""
+    """Apply period, toggle PIP/PD, wait the full curve-drawing delay for the chart to stabilize,
+    place the 2 points using the exact same steps as the original first chart, and screenshot."""
     if reload_tab:
         await notify(f"🔃 Reloading Trends tab (with +{extra_wait}s extra wait)...")
         _, tab = await find_in_frames(page, TRENDS_TAB, timeout=15)
@@ -1307,10 +1308,6 @@ async def render_and_screenshot_chart(
                 await asyncio.sleep(extra_wait)
             _, new_area = await find_in_frames(page, CHART_SEL, timeout=30, need_size=True)
             chart_area = new_area or chart_area
-
-        curve_wait = 6 + extra_wait
-        await notify(f"📈 Waiting {curve_wait}s for the curves to finish drawing...")
-        await asyncio.sleep(curve_wait)
     else:
         rng_text = await get_range_text(page)
 
@@ -1318,15 +1315,16 @@ async def render_and_screenshot_chart(
     period_label = compute_period_label(period, rng_text)
     await notify(f"🏷 Chart header well: {chart_well_name} | Estimated period: {period_label}")
 
-    # Toggle PIP and PD visibility
+    # 1. Toggle PIP and PD visibility first (before waiting for curves to draw)
     await set_tag_visibility_on_chart(page, PIP_TAG_SEL, "PIP (Press-Pump Intake)", remove_pip, notify)
     await set_tag_visibility_on_chart(page, PD_TAG_SEL, "PD (Press-Pump Discharge)", remove_pd, notify)
-    
-    # Give Highcharts ample time to finish redrawing axes and re-attaching tracker paths after a toggle
-    await notify("⏳ Waiting for chart layout to stabilize after curve toggle...")
-    await asyncio.sleep(5.0)
 
-    # Re-fetch chart_area AFTER toggling tags so place_points and screenshot use the fresh DOM element
+    # 2. Wait the exact same curve drawing and stabilization delay as the initial chart load
+    curve_wait = 6 + extra_wait
+    await notify(f"📈 Waiting {curve_wait}s for the curves to finish drawing and stabilizing...")
+    await asyncio.sleep(curve_wait)
+
+    # Re-fetch chart_area after stabilization so place_points targets the fresh DOM element
     _, fresh_chart_area = await find_in_frames(page, CHART_SEL, timeout=20, need_size=True)
     chart_area = fresh_chart_area or chart_area
 
@@ -1340,7 +1338,6 @@ async def render_and_screenshot_chart(
     crop_right(out_path, CROP_RIGHT_PX)
     await notify("📸 Chart screenshot captured")
     return chart_well_name, period_label
-
 
 async def capture_chart_advanced(
     well_name, page, notify, out_path, login_ui, period, remove_pip=False, remove_pd=False
