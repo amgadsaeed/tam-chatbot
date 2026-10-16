@@ -1286,8 +1286,7 @@ async def render_and_screenshot_chart(
     remove_pd=False,
     apply_dates=True,
 ):
-    """Apply period, toggle PIP/PD, wait the full curve-drawing delay for the chart to stabilize,
-    place the 2 points using the exact same steps as the original first chart, and screenshot."""
+    """Apply period, toggle PIP/PD, wait for stabilization, and place a fresh set of 2 freeze points."""
     if reload_tab:
         await notify(f"🔃 Reloading Trends tab (with +{extra_wait}s extra wait)...")
         _, tab = await find_in_frames(page, TRENDS_TAB, timeout=15)
@@ -1315,11 +1314,11 @@ async def render_and_screenshot_chart(
     period_label = compute_period_label(period, rng_text)
     await notify(f"🏷 Chart header well: {chart_well_name} | Estimated period: {period_label}")
 
-    # 1. Toggle PIP and PD visibility first (before waiting for curves to draw)
+    # 1. Toggle PIP and PD visibility first
     await set_tag_visibility_on_chart(page, PIP_TAG_SEL, "PIP (Press-Pump Intake)", remove_pip, notify)
     await set_tag_visibility_on_chart(page, PD_TAG_SEL, "PD (Press-Pump Discharge)", remove_pd, notify)
 
-    # 2. Wait the exact same curve drawing and stabilization delay as the initial chart load
+    # 2. Wait for the chart layout and curves to finish drawing
     curve_wait = 6 + extra_wait
     await notify(f"📈 Waiting {curve_wait}s for the curves to finish drawing and stabilizing...")
     await asyncio.sleep(curve_wait)
@@ -1328,8 +1327,15 @@ async def render_and_screenshot_chart(
     _, fresh_chart_area = await find_in_frames(page, CHART_SEL, timeout=20, need_size=True)
     chart_area = fresh_chart_area or chart_area
 
+    # 3. Always clear any leftover points and place a brand new set of 2 points
     if PLACE_POINTS:
         try:
+            chart_frame, _ = await find_in_frames(page, '#freezeDataContainer', timeout=5)
+            if chart_frame:
+                await chart_frame.evaluate("""() => {
+                    document.querySelectorAll('#freezeDataContainer img[id$="_close"]').forEach(b => b.click());
+                }""")
+                await asyncio.sleep(0.3)
             await place_points(page, chart_area, notify)
         except Exception as e:
             await notify(f"⚠️ Could not place the points: {str(e)[:200]} (continuing without them)")
