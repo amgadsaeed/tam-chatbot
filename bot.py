@@ -81,7 +81,7 @@ GRID_PARAMS = [
 GEMINI_MODEL_TIMEOUT_SEC = 60
 
 # Browser size (a narrower tab gives a narrower chart)
-VIEWPORT_W = 1400
+VIEWPORT_W = 1500
 VIEWPORT_H = 732
 
 # Chart points: two clicks on the Highcharts plot area (start and end of the lines)
@@ -108,6 +108,7 @@ FACILITY_TAB = 'a[onclick*="getTableData"][onclick*="Facility Parameter"]'
 CHART_SEL = 'div[data-dojo-type="ProductionChart"]'
 POINT_TARGET_SELECTOR = 'rect.highcharts-background'
 PD_TAG_SEL = 'div.tagContainer[name="Press-Pump Discharge"], div.tagContainer[channeldisplay="Press-Pump Discharge"]'
+PIP_TAG_SEL = 'div.tagContainer[name*="Press-Pump Intake"], div.tagContainer[channeldisplay*="Press-Pump Intake"]'
 
 SITE_URL = "https://productionlink.bakerhughes.com/"
 USER_AGENT = (
@@ -371,15 +372,18 @@ async def pick_period(bot, chat_id, well):
     return {"type": "custom", "start": start, "end": end}
 
 
-async def ask_remove_pd(bot, chat_id, well):
-    """Ask the user whether to keep or remove PD (Press-Pump Discharge) from the chart."""
+async def ask_curves_to_remove(bot, chat_id, well):
+    """Ask the user whether to remove PD, PIP, or both from the chart.
+    Returns (remove_pip: bool, remove_pd: bool)."""
     return await ask_choice(
         bot,
         chat_id,
-        f"📉 Do you want to keep or remove PD (Press-Pump Discharge) on the chart for {well}?",
+        f"📉 Which curves should be removed from the chart for {well}?",
         [
-            ("✅ Keep PD on the chart", False),
-            ("🚫 Remove PD from the chart", True),
+            ("✅ Keep all curves (PIP & PD)", (False, False)),
+            ("🚫 Remove PD only", (False, True)),
+            ("🚫 Remove PIP only", (True, False)),
+            ("🚫 Remove BOTH (PIP & PD)", (True, True)),
         ],
     )
 
@@ -905,16 +909,26 @@ def compute_period_label(period: dict, range_text: str = "") -> str:
     return "Last 24 Hours"
 
 
-async def set_pd_visibility_on_chart(page, remove_pd: bool, notify):
-    """Ensure Press-Pump Discharge (PD) on the chart is hidden (if remove_pd=True) or visible (if remove_pd=False)."""
-    _, tag_el = await find_in_frames(page, PD_TAG_SEL, timeout=12, need_size=True)
-    if not tag_el:
-        if remove_pd:
-            await notify("⚠️ Press-Pump Discharge tag container not found on chart.")
-        return
+async def set_tag_visibility_on_chart(page, selector: str, label: str, remove_tag: bool, notify):
+    """Ensure a chart tag (e.g. PIP or PD) is hidden (if remove_tag=True) or visible (if remove_tag=False)."""
+    # First, close any active freeze points so ProductionLink doesn't block legend clicks
+    for fr in page.frames:
+        try:
+            await fr.evaluate("""() => {
+                document.querySelectorAll('#freezeDataContainer img[id$="_close"]').forEach(b => b.click());
+                const fc = document.getElementById('freezeDataContainer');
+                if (fc) fc.style.pointerEvents = 'auto';
+            }""")
+        except Exception:
+            pass
+    await asyncio.sleep(0.4)
 
-    async def is_pd_currently_hidden():
-        return await tag_el.evaluate("""(el) => {
+    async def check_tag_state():
+        """Re-find the tag container fresh each time and check if it is grayed out (204, 204, 204)."""
+        _, tag_el = await find_in_frames(page, selector, timeout=10, need_size=True)
+        if not tag_el:
+            return None, False
+        is_hidden = await tag_el.evaluate("""(el) => {
             const valSpan = el.querySelector('.tagContainerValue');
             const lineEl = el.querySelector('svg line');
             const valColor = valSpan ? (valSpan.style.color || getComputedStyle(valSpan).color || '') : '';
@@ -922,27 +936,57 @@ async def set_pd_visibility_on_chart(page, remove_pd: bool, notify):
             const combined = (valColor + ' ' + strokeColor).replace(/\\s+/g, '').toLowerCase();
             return combined.includes('204,204,204') || combined.includes('#ccc') || combined.includes('#cccccc');
         }""")
+        return tag_el, is_hidden
 
-    currently_hidden = await is_pd_currently_hidden()
+    tag_el, currently_hidden = await check_tag_state()
+    if not tag_el:
+        if remove_tag:
+            await notify(f"⚠️ {label} tag container not found on chart.")
+        return
 
-    if remove_pd and not currently_hidden:
-        await notify("📉 Clicking 'Press-Pump Discharge' tag to remove PD from the chart...")
-        await click(tag_el)
-        await asyncio.sleep(2.5)
-        if await is_pd_currently_hidden():
-            await notify("✅ PD (Press-Pump Discharge) removed from the chart.")
+    want_hidden = bool(remove_tag)
+    if currently_hidden == want_hidden:
+        state_str = "removed from" if want_hidden else "visible on"
+        await notify(f"✅ {label} is already {state_str} the chart.")
+        return
+
+    action_str = f"remove {label} from" if want_hidden else f"restore {label} on"
+    await notify(f"📉 Clicking '{label}' tag to {action_str} the chart...")
+
+    for attempt in range(1, 4):
+        tag_el, currently_hidden = await check_tag_state()
+        if not tag_el or currently_hidden == want_hidden:
+            break
+
+        await tag_el.scroll_into_view_if_needed()
+        await asyncio.sleep(0.3)
+
+        if attempt == 1:
+            await click(tag_el)
+        elif attempt == 2:
+            inner = await tag_el.query_selector('span[id$="_tagName"], span.tagContainerValue')
+            await click(inner or tag_el)
         else:
-            await js_click(tag_el)
-            await asyncio.sleep(2.0)
-            await notify("✅ PD (Press-Pump Discharge) toggled off.")
-    elif remove_pd and currently_hidden:
-        await notify("✅ PD (Press-Pump Discharge) is already removed from the chart.")
-    elif not remove_pd and currently_hidden:
-        await notify("📈 Clicking 'Press-Pump Discharge' tag to restore PD on the chart...")
-        await click(tag_el)
-        await asyncio.sleep(2.5)
-        await notify("✅ PD (Press-Pump Discharge) restored on the chart.")
+            await tag_el.evaluate("""(el) => {
+                el.click();
+                const sp = el.querySelector('span[id$="_tagName"]') || el.querySelector('.tagContainerValue');
+                if (sp) sp.click();
+            }""")
 
+        # Wait for Highcharts & Y-axes to redraw after toggling the series
+        await asyncio.sleep(3.5)
+
+        _, currently_hidden = await check_tag_state()
+        if currently_hidden == want_hidden:
+            break
+        await notify(f"🔁 {label} toggle check (attempt {attempt}/3): retrying click...")
+
+    _, final_hidden = await check_tag_state()
+    if final_hidden == want_hidden:
+        await notify(f"✅ {label} {'removed from' if want_hidden else 'restored on'} the chart.")
+    else:
+        await notify(f"⚠️ {label} tag was clicked, but its color did not change as expected.")
+        
 
 async def find_preset_button(page, label, timeout=20):
     """The span.defaultFilter whose text is the label ('1 D', '3 D', ...; the page uses &nbsp;)."""
@@ -1231,38 +1275,57 @@ def crop_right(path, px):
 
 
 async def render_and_screenshot_chart(
-    page, notify, out_path, period, search_term="", extra_wait=0, reload_tab=False, remove_pd=False
+    page,
+    notify,
+    out_path,
+    period,
+    search_term="",
+    extra_wait=0,
+    reload_tab=False,
+    remove_pip=False,
+    remove_pd=False,
+    apply_dates=True,
 ):
-    """Apply `period` to the Trends chart, wait, toggle PD if requested, place the 2 points,
-    and save a screenshot. Returns (chart_well_name, period_label)."""
+    """Apply `period` (if apply_dates=True), toggle PIP/PD, place the 2 points on the updated plot, and screenshot."""
     if reload_tab:
         await notify(f"🔃 Reloading Trends tab (with +{extra_wait}s extra wait)...")
         _, tab = await find_in_frames(page, TRENDS_TAB, timeout=15)
         if tab:
             await click(tab)
             await asyncio.sleep(6 + extra_wait)
+        apply_dates = True
 
     _, chart_area = await find_in_frames(page, CHART_SEL, timeout=75, need_size=True)
     if not chart_area:
         raise Exception(f"Chart not found ({search_term}).\n" + frames_report(page))
 
-    rng_text = await apply_period(page, period, notify)
-    if period["type"] != "default":
-        if extra_wait > 0:
-            await notify(f"⏳ Waiting an extra {extra_wait}s for custom/preset range...")
-            await asyncio.sleep(extra_wait)
-        _, new_area = await find_in_frames(page, CHART_SEL, timeout=30, need_size=True)
-        chart_area = new_area or chart_area
+    if apply_dates:
+        rng_text = await apply_period(page, period, notify)
+        if period["type"] != "default":
+            if extra_wait > 0:
+                await notify(f"⏳ Waiting an extra {extra_wait}s for custom/preset range...")
+                await asyncio.sleep(extra_wait)
+            _, new_area = await find_in_frames(page, CHART_SEL, timeout=30, need_size=True)
+            chart_area = new_area or chart_area
 
-    curve_wait = 6 + extra_wait
-    await notify(f"📈 Waiting {curve_wait}s for the curves to finish drawing...")
-    await asyncio.sleep(curve_wait)
+        curve_wait = 6 + extra_wait
+        await notify(f"📈 Waiting {curve_wait}s for the curves to finish drawing...")
+        await asyncio.sleep(curve_wait)
+    else:
+        rng_text = await get_range_text(page)
 
     chart_well_name = await get_chart_well_name(page, fallback=search_term)
     period_label = compute_period_label(period, rng_text)
     await notify(f"🏷 Chart header well: {chart_well_name} | Estimated period: {period_label}")
 
-    await set_pd_visibility_on_chart(page, remove_pd=remove_pd, notify=notify)
+    # Toggle PIP and PD visibility (this redraws the Y-axes and shifts _chartArea's left offset/width)
+    await set_tag_visibility_on_chart(page, PIP_TAG_SEL, "PIP (Press-Pump Intake)", remove_pip, notify)
+    await set_tag_visibility_on_chart(page, PD_TAG_SEL, "PD (Press-Pump Discharge)", remove_pd, notify)
+    await asyncio.sleep(2.0)
+
+    # Re-fetch chart_area AFTER toggling tags so place_points and screenshot use the fresh DOM element
+    _, fresh_chart_area = await find_in_frames(page, CHART_SEL, timeout=20, need_size=True)
+    chart_area = fresh_chart_area or chart_area
 
     if PLACE_POINTS:
         try:
@@ -1276,7 +1339,9 @@ async def render_and_screenshot_chart(
     return chart_well_name, period_label
 
 
-async def capture_chart_advanced(well_name, page, notify, out_path, login_ui, period, remove_pd=False):
+async def capture_chart_advanced(
+    well_name, page, notify, out_path, login_ui, period, remove_pip=False, remove_pd=False
+):
     """Open the well for the first time, open the Trends tab, and capture the chart.
     Returns (chart_well_name, period_label)."""
     search_term, upper_name, clicked = await open_well(well_name, page, notify, login_ui)
@@ -1302,9 +1367,17 @@ async def capture_chart_advanced(well_name, page, notify, out_path, login_ui, pe
     await notify("⏳ Loading well data and chart...")
     await asyncio.sleep(14)
     return await render_and_screenshot_chart(
-        page, notify, out_path, period, search_term=upper_name, extra_wait=0, reload_tab=False, remove_pd=remove_pd
+        page,
+        notify,
+        out_path,
+        period,
+        search_term=upper_name,
+        extra_wait=0,
+        reload_tab=False,
+        remove_pip=remove_pip,
+        remove_pd=remove_pd,
+        apply_dates=True,
     )
-
 
 # =====================================================================================
 # Grid View > Facility Parameters
@@ -1494,7 +1567,12 @@ def format_report_numbers(param_key: str, text: str) -> str:
     return re.sub(r"\b\d+(?:,\d{3})*\.\d+\b", _replace_num, text)
 
 
-def build_prompt(well: str, period_label: str = "Last 24 Hours", remove_pd: bool = False) -> str:
+def build_prompt(well: str, period_label: str = "Last 24 Hours", remove_pip: bool = False, remove_pd: bool = False) -> str:
+    pip_instruction = (
+        '- "PIP" was intentionally hidden/removed by the user; set "PIP" status to "not_visible" with empty text.'
+        if remove_pip
+        else '- "PIP"       = "Pump Intake Pressure" or "Press-Pump Intake"'
+    )
     pd_instruction = (
         '- "PD" was intentionally hidden/removed by the user; set "PD" status to "not_visible" with empty text.'
         if remove_pd
@@ -1519,7 +1597,7 @@ Return ONLY one JSON object (no markdown, no code fence) with exactly this struc
 }}
 
 CURVE MAPPING (use the legend/labels on the chart):
-- "PIP"       = "Pump Intake Pressure" or "Press-Pump Intake"
+{pip_instruction}
 {pd_instruction}
 - "Motor Amp" = "Pwr-Motor Amps Ph B"
 - "Tm"        = "Temp-Motor"
@@ -1595,12 +1673,14 @@ async def _call_gemini_fast(model: str, contents: list, json_mode: bool = False,
         raise
 
 
-async def analyze_with_ai(image_path, well, period_label="Last 24 Hours", remove_pd=False, notify=None):
+async def analyze_with_ai(
+    image_path, well, period_label="Last 24 Hours", remove_pip=False, remove_pd=False, notify=None
+):
     """Ask the models in order and return the parsed JSON."""
     with open(image_path, "rb") as f:
         contents = [
             types.Part.from_bytes(data=f.read(), mime_type="image/png"),
-            build_prompt(well, period_label=period_label, remove_pd=remove_pd),
+            build_prompt(well, period_label=period_label, remove_pip=remove_pip, remove_pd=remove_pd),
         ]
 
     models = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACKS if m != GEMINI_MODEL]
@@ -1623,7 +1703,6 @@ async def analyze_with_ai(image_path, well, period_label="Last 24 Hours", remove
                 nxt = f" Trying {models[i + 1]}..." if i + 1 < len(models) else ""
                 await notify(f"⚠️ {model} failed ({short}).{nxt}")
     raise Exception("All Gemini models failed:\n" + "\n".join(errors))
-
 
 async def refine_report_with_ai(image_path, well, period_label, current_report, user_instruction, notify=None):
     """Refine the existing WhatsApp report using the chart image and the user's follow-up prompt."""
@@ -1730,13 +1809,22 @@ async def resolve_decisions(
     image_path,
     page=None,
     period=None,
+    remove_pip=False,
     remove_pd=False,
     update_msg=None,
     notify=None,
 ):
     """Ask what to do with each parameter that is missing or 0 all along.
-    If `remove_pd=True`, PD is automatically excluded without asking."""
-    decisions = {"PD": ("remove", None)} if remove_pd else {}
+    Automatically excludes PIP and/or PD if the user chose to remove them."""
+    def _init_decisions():
+        d = {}
+        if remove_pip:
+            d["PIP"] = ("remove", None)
+        if remove_pd:
+            d["PD"] = ("remove", None)
+        return d
+
+    decisions = _init_decisions()
     extra_wait = 0
 
     while True:
@@ -1794,7 +1882,9 @@ async def resolve_decisions(
                     well,
                     extra_wait=extra_wait,
                     reload_tab=True,
+                    remove_pip=remove_pip,
                     remove_pd=remove_pd,
+                    apply_dates=True,
                 )
                 with open(image_path, "rb") as photo:
                     if update_msg:
@@ -1806,9 +1896,14 @@ async def resolve_decisions(
                             chat_id, photo=photo, caption=f"📊 Reloaded chart (+{extra_wait}s wait) for well: {well}"
                         )
                 data = await analyze_with_ai(
-                    image_path, well, period_label=period_label, remove_pd=remove_pd, notify=notify
+                    image_path,
+                    well,
+                    period_label=period_label,
+                    remove_pip=remove_pip,
+                    remove_pd=remove_pd,
+                    notify=notify,
                 )
-                decisions = {"PD": ("remove", None)} if remove_pd else {}
+                decisions = _init_decisions()
             except SessionEndedException:
                 raise
             except Exception as e:
@@ -1816,9 +1911,14 @@ async def resolve_decisions(
         else:  # re-analyze
             try:
                 data = await analyze_with_ai(
-                    image_path, well, period_label=period_label, remove_pd=remove_pd, notify=notify
+                    image_path,
+                    well,
+                    period_label=period_label,
+                    remove_pip=remove_pip,
+                    remove_pd=remove_pd,
+                    notify=notify,
                 )
-                decisions = {"PD": ("remove", None)} if remove_pd else {}
+                decisions = _init_decisions()
             except SessionEndedException:
                 raise
             except Exception as e:
@@ -2267,15 +2367,22 @@ async def run_grid_flow(bot, chat_id, well, notify, debug_path):
 
 
 async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_path):
-    """Open Trends chart, read the true well name from the chart header, optionally remove PD,
+    """Open Trends chart, read the true well name from the chart header, optionally remove PIP/PD,
     estimate the period in hours (or hours and half), and analyze with Gemini."""
     period = await pick_period(bot, chat_id, well)
-    remove_pd = await ask_remove_pd(bot, chat_id, well)
+    remove_pip, remove_pd = await ask_curves_to_remove(bot, chat_id, well)
     extra_wait = 0
 
     async with browser_page(debug_path) as page:
         chart_well, period_label = await capture_chart_advanced(
-            well, page, notify, path, LoginUI(bot, chat_id), period, remove_pd=remove_pd
+            well,
+            page,
+            notify,
+            path,
+            LoginUI(bot, chat_id),
+            period,
+            remove_pip=remove_pip,
+            remove_pd=remove_pd,
         )
 
         while True:
@@ -2285,7 +2392,12 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
                 )
 
             data = await analyze_with_ai(
-                path, chart_well, period_label=period_label, remove_pd=remove_pd, notify=notify
+                path,
+                chart_well,
+                period_label=period_label,
+                remove_pip=remove_pip,
+                remove_pd=remove_pd,
+                notify=notify,
             )
             data, decisions, chart_well, period_label = await resolve_decisions(
                 bot,
@@ -2296,6 +2408,7 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
                 path,
                 page=page,
                 period=period,
+                remove_pip=remove_pip,
                 remove_pd=remove_pd,
                 update_msg=update_msg,
                 notify=notify,
@@ -2306,6 +2419,9 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
 
             # Post-report options loop
             while True:
+                pip_toggle_label = (
+                    "📈 Restore PIP on chart" if remove_pip else "🚫 Remove PIP from chart"
+                )
                 pd_toggle_label = (
                     "📈 Restore PD on chart" if remove_pd else "🚫 Remove PD from chart"
                 )
@@ -2316,6 +2432,7 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
                     [
                         ("🔃 Reload chart & resend screenshot (+5s wait)", "reload_chart"),
                         ("🗓 Edit chart period", "edit_period"),
+                        (pip_toggle_label, "toggle_pip"),
                         (pd_toggle_label, "toggle_pd"),
                         ("💬 Edit observation with Gemini", "edit_gemini"),
                     ],
@@ -2336,6 +2453,22 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
                     await notify("✅ Observation updated")
                     continue
 
+                if next_action == "toggle_pip":
+                    remove_pip = not remove_pip
+                    chart_well, period_label = await render_and_screenshot_chart(
+                        page,
+                        notify,
+                        path,
+                        period,
+                        chart_well,
+                        extra_wait=extra_wait,
+                        reload_tab=False,
+                        remove_pip=remove_pip,
+                        remove_pd=remove_pd,
+                        apply_dates=False,
+                    )
+                    break
+
                 if next_action == "toggle_pd":
                     remove_pd = not remove_pd
                     chart_well, period_label = await render_and_screenshot_chart(
@@ -2346,7 +2479,9 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
                         chart_well,
                         extra_wait=extra_wait,
                         reload_tab=False,
+                        remove_pip=remove_pip,
                         remove_pd=remove_pd,
+                        apply_dates=False,
                     )
                     break
 
@@ -2360,14 +2495,16 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
                         chart_well,
                         extra_wait=extra_wait,
                         reload_tab=True,
+                        remove_pip=remove_pip,
                         remove_pd=remove_pd,
+                        apply_dates=True,
                     )
                     break
 
                 if next_action == "edit_period":
                     extra_wait = 0
                     period = await pick_period(bot, chat_id, chart_well)
-                    remove_pd = await ask_remove_pd(bot, chat_id, chart_well)
+                    remove_pip, remove_pd = await ask_curves_to_remove(bot, chat_id, chart_well)
                     chart_well, period_label = await render_and_screenshot_chart(
                         page,
                         notify,
@@ -2376,7 +2513,9 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
                         chart_well,
                         extra_wait=0,
                         reload_tab=False,
+                        remove_pip=remove_pip,
                         remove_pd=remove_pd,
+                        apply_dates=True,
                     )
                     break
 
