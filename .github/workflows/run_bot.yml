@@ -1,9 +1,11 @@
 name: Run ESP Telegram Bot 24/7
 
 on:
-  workflow_dispatch: # Lets you start it manually with 1 click
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]  # Automatically triggers a fresh run whenever you push code!
   schedule:
-    - cron: '0 */5 * * *' # Automatically restarts every 5 hours
+    - cron: '0 */5 * * *'
 
 jobs:
   run-bot:
