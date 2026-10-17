@@ -1,6 +1,8 @@
 import os
 import re
 import json
+import shutil
+import zipfile
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import html as html_lib
@@ -12,6 +14,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 from PIL import Image
+import openpyxl
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -32,15 +35,25 @@ nest_asyncio.apply()
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GEMINI_KEY = os.environ["GEMINI_KEY"]
 
-# Models are tried in this order, ONE attempt each
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+# Models are tried in this order; if ALL fail, the entire list is retried again!
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+DEFAULT_FALLBACK_MODELS = (
+    "gemini-2.5-pro,"
+    "gemini-2.5-flash-lite,"
+    "gemini-2.0-flash,"
+    "gemini-2.0-flash-lite,"
+    "gemini-3.8-flash,"
+    "gemini-3.5-flash-lite"
+)
 GEMINI_FALLBACKS = [
     m.strip()
-    for m in os.environ.get("GEMINI_FALLBACKS", "gemini-3.5-flash-lite,gemini-3.1-pro").split(",")
+    for m in os.environ.get("GEMINI_FALLBACKS", DEFAULT_FALLBACK_MODELS).split(",")
     if m.strip()
 ]
+GEMINI_FULL_RETRY_ROUNDS = 2       # how many full passes through all models before giving up
+GEMINI_MODEL_TIMEOUT_SEC = 60      # max seconds per single model attempt
 
-# Login (Okta): accounts live in credentials.json (or CREDENTIALS_JSON env var on Render)
+# Login (Okta): accounts live in credentials.json (or CREDENTIALS_JSON env var)
 CREDENTIALS_FILE = os.environ.get("CREDENTIALS_FILE", "credentials.json")
 if os.environ.get("CREDENTIALS_JSON") and not os.path.exists(CREDENTIALS_FILE):
     with open(CREDENTIALS_FILE, "w", encoding="utf-8") as _f:
@@ -77,13 +90,10 @@ GRID_PARAMS = [
     "Pwr-Motor Amps Ph B",
 ]
 
-# max seconds per model attempt (keeps total AI time well under 2 minutes)
-GEMINI_MODEL_TIMEOUT_SEC = 60
-
 # Well search retries (verifies via breadcrumb li.current a)
 MAX_SEARCH_ATTEMPTS = 3
 
-# Browser size (a narrower tab gives a narrower chart)
+# Browser size
 VIEWPORT_W = 1500
 VIEWPORT_H = 732
 
@@ -94,6 +104,9 @@ POINT_Y_FRAC = 0.70                # fallback vertical position (0 = top, 1 = bo
 START_CLICK_FROM_LEFT_PX = 10      # first click: 10 px inside the plot's left edge
 END_CLICK_FROM_RIGHT_PX = 4        # second click: 4 px inside the plot's right edge
 CROP_RIGHT_PX = 35
+
+# Export data wait time (seconds) before checking Export Status
+EXPORT_BG_WAIT_SEC = 50
 
 # Custom date range: waits (seconds) so the page can keep up
 CUSTOM_OPEN_ATTEMPTS = 5           # tries to open the date picker
@@ -112,6 +125,13 @@ CHART_SEL = 'div[data-dojo-type="ProductionChart"]'
 POINT_TARGET_SELECTOR = 'rect.highcharts-background'
 PD_TAG_SEL = 'div.tagContainer[name="Press-Pump Discharge"], div.tagContainer[channeldisplay="Press-Pump Discharge"]'
 PIP_TAG_SEL = 'div.tagContainer[name*="Press-Pump Intake"], div.tagContainer[channeldisplay*="Press-Pump Intake"]'
+
+# Export selectors
+EXPORT_ICON_SEL = 'img[id$="dataExport"], div.export-icon-trendchart img[title="Export Chart"], div.export-icon-trendchart'
+EXPORT_DATA_LI_SEL = 'li[id$="exportData"], li[title="Export Data"]'
+EXPORT_STATUS_LI_SEL = 'li[id$="exportStatus"], li[title="Export Status"]'
+EXPORT_OK_BTN_SEL = 'button#exportButtonOk, div[aria-describedby$="exportstartdownloaddiv"] button'
+EXPORT_FIRST_ROW_DL_SEL = 'td#downloladStatusTd0 img[onclick*="downloadExportedFile"], td#downloladStatusTd0, tbody[id$="exportDownlaodStatusTbody"] img[onclick*="downloadExportedFile"]'
 
 SITE_URL = "https://productionlink.bakerhughes.com/"
 USER_AGENT = (
@@ -727,7 +747,6 @@ async def get_current_well_name(page):
                     return txt
         except Exception:
             pass
-    # Fallback: return any non-empty li.current a text
     for fr in page.frames:
         try:
             el = await fr.query_selector("li.current a")
@@ -872,7 +891,6 @@ async def open_well(well_name, page, notify, login_ui):
     prefix = get_well_prefix(cleaned_name)
     expected_well = f"{prefix}{cleaned_name}"
 
-    # Check if the requested well is already open via the breadcrumb
     already_open = await get_current_well_name(page)
     if already_open and already_open.strip().upper() == expected_well.strip().upper():
         await notify(f"✅ Well '{already_open}' is already confirmed open.")
@@ -903,10 +921,8 @@ async def open_well(well_name, page, notify, login_ui):
             if not clicked:
                 clicked = await click_well_result(page, expected_well)
 
-            # Wait for #productionEventLink (or breadcrumb) to confirm the well view loaded
             await find_in_frames(page, "#productionEventLink, li.current a", timeout=20)
 
-            # Poll breadcrumb up to 8 seconds in case the DOM updates slightly after Enter
             current_well = None
             for _ in range(8):
                 current_well = await get_current_well_name(page)
@@ -1233,6 +1249,201 @@ async def apply_period(page, period, notify):
 
 
 # =====================================================================================
+# Trends: Export Chart Data (.zip -> .xlsx), Unzip, Parse for Gemini
+# =====================================================================================
+async def _open_export_menu_and_click(page, item_selector: str, item_name: str, notify):
+    """Click the Export Chart icon (id$='dataExport'), force its tooltip menu visible if needed,
+    and click `item_selector` ('Export Data' or 'Export Status')."""
+    fr, icon = await find_in_frames(page, EXPORT_ICON_SEL, timeout=15, need_size=True)
+    if not icon:
+        raise Exception("Export Chart icon (id$='dataExport') was not found.")
+
+    await click(icon)
+    await asyncio.sleep(1.0)
+
+    # Ensure the .tooltip-links dropdown is visible even if the click didn't toggle display:block
+    try:
+        await fr.evaluate("""() => {
+            document.querySelectorAll('div.export-icon-trendchart .tooltip-links').forEach(d => {
+                d.style.display = 'block';
+            });
+        }""")
+    except Exception:
+        pass
+    await asyncio.sleep(0.5)
+
+    _, menu_item = await find_in_frames(page, item_selector, timeout=10)
+    if not menu_item:
+        raise Exception(f"'{item_name}' option ({item_selector}) was not found.")
+
+    await notify(f"📥 Clicking '{item_name}'...")
+    await click(menu_item)
+
+
+def _unzip_and_collect_excels(downloaded_path: str, extract_dir: str) -> list:
+    """If `downloaded_path` is a .zip file, unzip it into `extract_dir` and return all .xlsx/.xls/.csv paths.
+    If it is already an Excel/CSV file, return [downloaded_path]."""
+    os.makedirs(extract_dir, exist_ok=True)
+    excel_files = []
+
+    if zipfile.is_zipfile(downloaded_path):
+        with zipfile.ZipFile(downloaded_path, "r") as zf:
+            zf.extractall(extract_dir)
+        for root, _, files in os.walk(extract_dir):
+            for f in sorted(files):
+                if f.lower().endswith((".xlsx", ".xls", ".csv")) and not f.startswith("~$"):
+                    excel_files.append(os.path.join(root, f))
+    elif downloaded_path.lower().endswith((".xlsx", ".xls", ".csv")):
+        dest = os.path.join(extract_dir, os.path.basename(downloaded_path))
+        shutil.copy2(downloaded_path, dest)
+        excel_files.append(dest)
+
+    return excel_files
+
+
+def extract_excel_text_for_ai(excel_paths: list, max_chars: int = 35000) -> str:
+    """Read the exported Excel (.xlsx) or CSV files and format their contents as a clean text summary
+    for Gemini so it can see exact numerical readings alongside the chart image."""
+    if not excel_paths:
+        return ""
+
+    chunks = []
+    for path in excel_paths:
+        fname = os.path.basename(path)
+        try:
+            if path.lower().endswith(".csv"):
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = [line.strip() for line in f if line.strip()]
+                if len(lines) > 250:
+                    head = lines[:120]
+                    tail = lines[-120:]
+                    body = "\n".join(head + [f"... ({len(lines) - 240} middle rows omitted) ..."] + tail)
+                else:
+                    body = "\n".join(lines)
+                chunks.append(f"=== File: {fname} ===\n{body}")
+            else:
+                wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+                for sheet_name in wb.sheetnames:
+                    ws = wb[sheet_name]
+                    rows_txt = []
+                    for row in ws.iter_rows(values_only=True):
+                        if any(cell is not None and str(cell).strip() != "" for cell in row):
+                            row_str = "\t".join("" if c is None else str(c).strip() for c in row)
+                            rows_txt.append(row_str)
+                    if not rows_txt:
+                        continue
+                    if len(rows_txt) > 250:
+                        # Include header + first 120 rows + last 120 rows so start, trend, and end are 100% exact
+                        selected = (
+                            rows_txt[:120]
+                            + [f"... ({len(rows_txt) - 240} middle rows omitted) ..."]
+                            + rows_txt[-120:]
+                        )
+                    else:
+                        selected = rows_txt
+                    chunks.append(f"=== File: {fname} | Sheet: {sheet_name} (Total rows: {len(rows_txt)}) ===\n" + "\n".join(selected))
+                wb.close()
+        except Exception as e:
+            chunks.append(f"=== File: {fname} (could not parse: {e}) ===")
+
+    combined = "\n\n".join(chunks)
+    return combined[:max_chars]
+
+
+async def export_and_download_chart_excel(page, notify, extract_dir: str) -> list:
+    """Follows the exact Export Chart -> Export Data -> (optional OK dialog) -> 50s wait ->
+    Export Status -> first row download workflow. Unzips the .zip and returns the list of Excel file paths."""
+    os.makedirs(extract_dir, exist_ok=True)
+    downloaded_zip_path = None
+
+    await notify("📥 Starting chart data export...")
+
+    # Attach a listener in case clicking "Export Data" triggers an immediate browser download
+    immediate_dl_fut = asyncio.get_running_loop().create_future()
+
+    def _on_dl(dl):
+        if not immediate_dl_fut.done():
+            immediate_dl_fut.set_result(dl)
+
+    page.on("download", _on_dl)
+    try:
+        await _open_export_menu_and_click(page, EXPORT_DATA_LI_SEL, "Export Data", notify)
+
+        # Check for up to 6 seconds whether an immediate download started OR the Export Notification dialog appeared
+        ok_btn = None
+        for _ in range(12):
+            if immediate_dl_fut.done():
+                break
+            _, btn = await find_in_frames(page, EXPORT_OK_BTN_SEL, timeout=1)
+            if btn and await btn.is_visible():
+                ok_btn = btn
+                break
+            await asyncio.sleep(0.5)
+
+        if immediate_dl_fut.done():
+            dl = await immediate_dl_fut
+            fname = dl.suggested_filename or "chart_export.zip"
+            downloaded_zip_path = os.path.join(extract_dir, fname)
+            await dl.save_as(downloaded_zip_path)
+            await notify(f"✅ Export downloaded directly: {fname}")
+        else:
+            if ok_btn:
+                await notify("🆗 'Export Notification' popup appeared; clicking OK...")
+                await click(ok_btn)
+                await asyncio.sleep(1.0)
+            else:
+                await notify("ℹ️ No 'Export Notification' popup appeared; proceeding to wait for background export...")
+
+            await notify(f"⏳ Waiting {EXPORT_BG_WAIT_SEC}s for the export file to be created...")
+            await asyncio.sleep(EXPORT_BG_WAIT_SEC)
+
+            # Open the Export menu again and click "Export Status"
+            await _open_export_menu_and_click(page, EXPORT_STATUS_LI_SEL, "Export Status", notify)
+            await asyncio.sleep(3.0)
+
+            # Wait for the Export Status table and the first row's download button (#downloladStatusTd0)
+            status_fr, dl_el = await find_in_frames(page, EXPORT_FIRST_ROW_DL_SEL, timeout=25, need_size=True)
+            if not dl_el:
+                raise Exception("Export Status table or first row download icon (#downloladStatusTd0) was not found.")
+
+            # If the first row is still "In Progress", poll up to 30 extra seconds until its download icon is ready
+            img_el = await status_fr.query_selector(
+                'td#downloladStatusTd0 img[onclick*="downloadExportedFile"]'
+            ) or dl_el
+
+            await notify("📥 Clicking download on the first row of Export Status...")
+            async with page.expect_download(timeout=60000) as dl_info:
+                await click(img_el)
+            dl = await dl_info.value
+            fname = dl.suggested_filename or "chart_export.zip"
+            downloaded_zip_path = os.path.join(extract_dir, fname)
+            await dl.save_as(downloaded_zip_path)
+            await notify(f"✅ Downloaded export archive: {fname}")
+
+            # Close the Export Status dialog if a close button is present
+            try:
+                close_dlg_btn = await status_fr.query_selector(
+                    'div[aria-describedby$="exportDownlaodStatusDiv"] button.ui-dialog-titlebar-close'
+                )
+                if close_dlg_btn and await close_dlg_btn.is_visible():
+                    await click(close_dlg_btn)
+            except Exception:
+                pass
+    finally:
+        try:
+            page.remove_listener("download", _on_dl)
+        except Exception:
+            pass
+
+    if not downloaded_zip_path or not os.path.exists(downloaded_zip_path):
+        raise Exception("Export file download did not produce a saved file.")
+
+    excel_files = _unzip_and_collect_excels(downloaded_zip_path, extract_dir)
+    await notify(f"📂 Unzipped {len(excel_files)} Excel/data file(s) from export.")
+    return excel_files
+
+
+# =====================================================================================
 # Trends: points, crop, capture
 # =====================================================================================
 async def place_points(page, chart_area, notify):
@@ -1422,8 +1633,10 @@ async def render_and_screenshot_chart(
     remove_pip=False,
     remove_pd=False,
     apply_dates=True,
+    export_dir=None,
 ):
-    """Apply `period`, toggle PIP/PD, wait for stabilization, and place a fresh set of 2 freeze points."""
+    """Apply `period`, toggle PIP/PD, place 2 freeze points, screenshot the chart,
+    and export/unzip the Excel data sheet for the current view."""
     if reload_tab:
         await notify(f"🔃 Reloading Trends tab (with +{extra_wait}s extra wait)...")
         _, tab = await find_in_frames(page, TRENDS_TAB, timeout=15)
@@ -1476,17 +1689,35 @@ async def render_and_screenshot_chart(
     await chart_area.screenshot(path=out_path)
     crop_right(out_path, CROP_RIGHT_PX)
     await notify("📸 Chart screenshot captured")
-    return chart_well_name, period_label
+
+    # Export and download the Excel data sheet for the current view
+    excel_files = []
+    if export_dir:
+        try:
+            shutil.rmtree(export_dir, ignore_errors=True)
+            excel_files = await export_and_download_chart_excel(page, notify, export_dir)
+        except Exception as e:
+            await notify(f"⚠️ Could not export Excel sheet: {str(e)[:200]} (continuing with screenshot)")
+
+    return chart_well_name, period_label, excel_files
 
 
 async def capture_chart_advanced(
-    well_name, page, notify, out_path, login_ui, period, remove_pip=False, remove_pd=False, extra_wait=0
+    well_name,
+    page,
+    notify,
+    out_path,
+    login_ui,
+    period,
+    remove_pip=False,
+    remove_pd=False,
+    extra_wait=0,
+    export_dir=None,
 ):
     """Run the full Trends chart capture process from the start (confirm well via breadcrumb,
-    ensure Trends tab is open, wait for chart load, apply period, remove PIP/PD, and place 2 points)."""
+    ensure Trends tab is open, wait for chart load, apply period, remove PIP/PD, place 2 points, and export Excel)."""
     search_term, upper_name, clicked = await open_well(well_name, page, notify, login_ui)
 
-    # Clicking Trends tab forces a clean chart reload with default dimensions before applying period & toggles
     _, tab = await find_in_frames(page, TRENDS_TAB, timeout=20)
     if tab:
         await notify("📑 Opening / refreshing Trends tab...")
@@ -1523,6 +1754,7 @@ async def capture_chart_advanced(
         remove_pip=remove_pip,
         remove_pd=remove_pd,
         apply_dates=True,
+        export_dir=export_dir,
     )
 
 
@@ -1659,7 +1891,7 @@ def format_grid_message(well, results):
 
 
 # =====================================================================================
-# Gemini analysis and report (including follow-up prompt editing)
+# Gemini analysis and report (with Excel data + multi-round model retry)
 # =====================================================================================
 EXCLUDED_EXTRAS_RE = re.compile(
     r"vib.*y|vy\b|y\s*axis|temp.*intake|intake.*temp|ti\b",
@@ -1714,7 +1946,13 @@ def format_report_numbers(param_key: str, text: str) -> str:
     return re.sub(r"\b\d+(?:,\d{3})*\.\d+\b", _replace_num, text)
 
 
-def build_prompt(well: str, period_label: str = "Last Day", remove_pip: bool = False, remove_pd: bool = False) -> str:
+def build_prompt(
+    well: str,
+    period_label: str = "Last Day",
+    remove_pip: bool = False,
+    remove_pd: bool = False,
+    excel_text: str = "",
+) -> str:
     pip_instruction = (
         '- "PIP" was intentionally hidden/removed by the user; set "PIP" status to "not_visible" with empty text.'
         if remove_pip
@@ -1725,9 +1963,14 @@ def build_prompt(well: str, period_label: str = "Last Day", remove_pip: bool = F
         if remove_pd
         else '- "PD"        = "Press-Pump Discharge"'
     )
+    excel_section = (
+        f"\n\nEXPORTED EXCEL DATA FOR THIS VIEW (use these exact numbers to make your readings 100% accurate):\n{excel_text}\n"
+        if excel_text
+        else ""
+    )
     return f"""You are an ESP (Electric Submersible Pump) surveillance engineer.
-Analyze the attached ProductionLink chart image for well {well} and describe what happened
-during the period shown on the chart ({period_label}).
+Analyze the attached ProductionLink chart image (and the exported Excel sheet data if provided below) for well {well}
+and describe what happened during the period shown on the chart ({period_label}).
 
 Return ONLY one JSON object (no markdown, no code fence) with exactly this structure:
 
@@ -1743,7 +1986,7 @@ Return ONLY one JSON object (no markdown, no code fence) with exactly this struc
   ]
 }}
 
-CURVE MAPPING (use the legend/labels on the chart):
+CURVE MAPPING (use the legend/labels on the chart and columns in the Excel sheet):
 {pip_instruction}
 {pd_instruction}
 - "Motor Amp" = "Pwr-Motor Amps Ph B"
@@ -1759,7 +2002,7 @@ NUMBER ROUNDING & PRECISION RULES (MANDATORY):
 - "Motor Amp", "Tm", and "Vibration (Vx)": AT MOST ONE decimal place (1 fraction digit, e.g. 40.2 A, 324.5 F, 0.1 G — round 0.12 G to 0.1 G).
 
 STATUS RULES:
-- "ok": you can read the curve and describe it. Fill "text".
+- "ok": you can read the parameter and describe it. Fill "text".
 - "not_visible": the curve for this parameter is not on the chart (or its legend tag is grayed out). Leave "text" empty and explain in "note".
 - "unreadable": the curve exists but the values cannot be read reliably. Leave "text" empty and explain in "note".
 - "zero": the curve is visible (active colored legend, not grayed out) and stays at 0 (flat on the zero line) for the WHOLE period.
@@ -1779,7 +2022,7 @@ STYLE OF "text" (no parameter name, no asterisks, no trailing period, units alwa
 "extras": other parameters clearly visible on the chart (for example Vibration (Vx)), EXCEPT "Vibration (Vy)" / "Vib-Pump Y axis" and "Temp-Pump Intake" which must NEVER be included.
 Use the same style. Leave the list empty if there are none. Do not put the four main parameters there.
 
-Write in English."""
+Write in English.{excel_section}"""
 
 
 def parse_json_loose(text: str) -> dict:
@@ -1820,40 +2063,82 @@ async def _call_gemini_fast(model: str, contents: list, json_mode: bool = False,
         raise
 
 
+def _ordered_models() -> list:
+    """Return deduplicated list of primary + fallback Gemini models."""
+    seen = set()
+    models = []
+    for m in [GEMINI_MODEL] + GEMINI_FALLBACKS:
+        if m and m not in seen:
+            seen.add(m)
+            models.append(m)
+    return models
+
+
 async def analyze_with_ai(
-    image_path, well, period_label="Last Day", remove_pip=False, remove_pd=False, notify=None
+    image_path,
+    well,
+    period_label="Last Day",
+    remove_pip=False,
+    remove_pd=False,
+    excel_files=None,
+    notify=None,
 ):
-    """Ask the models in order and return the parsed JSON."""
+    """Ask the models in order; if ALL models fail, retry the full list again."""
+    excel_text = extract_excel_text_for_ai(excel_files or [])
     with open(image_path, "rb") as f:
-        contents = [
-            types.Part.from_bytes(data=f.read(), mime_type="image/png"),
-            build_prompt(well, period_label=period_label, remove_pip=remove_pip, remove_pd=remove_pd),
-        ]
+        img_bytes = f.read()
 
-    models = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACKS if m != GEMINI_MODEL]
+    contents = [
+        types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
+        build_prompt(
+            well,
+            period_label=period_label,
+            remove_pip=remove_pip,
+            remove_pd=remove_pd,
+            excel_text=excel_text,
+        ),
+    ]
+
+    models = _ordered_models()
     errors = []
-    for i, model in enumerate(models):
-        try:
-            if notify:
-                await notify(f"⚡ Analyzing the chart with {model} (max {GEMINI_MODEL_TIMEOUT_SEC}s)...")
-            resp = await _call_gemini_fast(model, contents, json_mode=True, timeout=GEMINI_MODEL_TIMEOUT_SEC)
-            if not resp.text:
-                raise Exception("empty response")
-            data = parse_json_loose(resp.text)
-            if not isinstance(data, dict) or "parameters" not in data:
-                raise Exception("unexpected JSON structure")
-            return data
-        except Exception as e:
-            short = re.sub(r"\s+", " ", str(e))[:160]
-            errors.append(f"{model}: {short}")
-            if notify:
-                nxt = f" Trying {models[i + 1]}..." if i + 1 < len(models) else ""
-                await notify(f"⚠️ {model} failed ({short}).{nxt}")
-    raise Exception("All Gemini models failed:\n" + "\n".join(errors))
+
+    for round_num in range(1, GEMINI_FULL_RETRY_ROUNDS + 1):
+        if round_num > 1 and notify:
+            await notify(f"🔁 All models failed on pass {round_num - 1}; retrying all models again (pass {round_num}/{GEMINI_FULL_RETRY_ROUNDS})...")
+            await asyncio.sleep(3)
+
+        for i, model in enumerate(models):
+            try:
+                if notify:
+                    extra_tag = " + Excel sheet" if excel_text else ""
+                    await notify(f"⚡ Analyzing chart{extra_tag} with {model} (pass {round_num}/{GEMINI_FULL_RETRY_ROUNDS})...")
+                resp = await _call_gemini_fast(model, contents, json_mode=True, timeout=GEMINI_MODEL_TIMEOUT_SEC)
+                if not resp.text:
+                    raise Exception("empty response")
+                data = parse_json_loose(resp.text)
+                if not isinstance(data, dict) or "parameters" not in data:
+                    raise Exception("unexpected JSON structure")
+                return data
+            except Exception as e:
+                short = re.sub(r"\s+", " ", str(e))[:160]
+                errors.append(f"[Pass {round_num}] {model}: {short}")
+                if notify:
+                    nxt = f" Trying {models[i + 1]}..." if i + 1 < len(models) else ""
+                    await notify(f"⚠️ {model} failed ({short}).{nxt}")
+
+    raise Exception("All Gemini models failed after retrying:\n" + "\n".join(errors))
 
 
-async def refine_report_with_ai(image_path, well, period_label, current_report, user_instruction, notify=None):
-    """Refine the existing WhatsApp report using the chart image and the user's follow-up prompt."""
+async def refine_report_with_ai(
+    image_path, well, period_label, current_report, user_instruction, excel_files=None, notify=None
+):
+    """Refine the existing WhatsApp report using the chart image, exported Excel data, and user's follow-up prompt."""
+    excel_text = extract_excel_text_for_ai(excel_files or [])
+    excel_section = (
+        f"\n\nEXPORTED EXCEL DATA FOR THIS VIEW:\n{excel_text}\n"
+        if excel_text
+        else ""
+    )
     prompt = f"""You are an ESP (Electric Submersible Pump) surveillance engineer.
 Here is the current well performance report for well {well}:
 
@@ -1868,35 +2153,42 @@ STRICT RULES:
    - PIP, PD, and Frequency (Hz): whole numbers only (NO decimals, e.g. 2864 Psi, 45 Hz).
    - Motor Amp, Tm, and Vibration (Vx): maximum 1 decimal place (e.g. 40.2 A, 324.5 F, 0.1 G).
 
-Using the attached chart image and the user's instruction, return ONLY the updated report in the exact same WhatsApp format (starting with *{well} | Well Performance Update ({period_label})* and using bullet points `- *Parameter*: ...`). Do not wrap it in markdown code fences or add extra commentary."""
+Using the attached chart image, the exported Excel data (if provided), and the user's instruction, return ONLY the updated report in the exact same WhatsApp format (starting with *{well} | Well Performance Update ({period_label})* and using bullet points `- *Parameter*: ...`). Do not wrap it in markdown code fences or add extra commentary.{excel_section}"""
 
     with open(image_path, "rb") as f:
         contents = [types.Part.from_bytes(data=f.read(), mime_type="image/png"), prompt]
 
-    models = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACKS if m != GEMINI_MODEL]
+    models = _ordered_models()
     errors = []
-    for i, model in enumerate(models):
-        try:
-            if notify:
-                await notify(f"⚡ Updating observation with {model} (max {GEMINI_MODEL_TIMEOUT_SEC}s)...")
-            resp = await _call_gemini_fast(model, contents, json_mode=False, timeout=GEMINI_MODEL_TIMEOUT_SEC)
-            if not resp.text:
-                raise Exception("empty response")
-            out_lines = []
-            for line in resp.text.strip().splitlines():
-                m = re.match(r"^(-\s*\*([^*]+)\*:\s*)(.+)$", line)
-                if m:
-                    out_lines.append(f"{m.group(1)}{format_report_numbers(m.group(2), m.group(3))}")
-                else:
-                    out_lines.append(line)
-            return "\n".join(out_lines)
-        except Exception as e:
-            short = re.sub(r"\s+", " ", str(e))[:160]
-            errors.append(f"{model}: {short}")
-            if notify:
-                nxt = f" Trying {models[i + 1]}..." if i + 1 < len(models) else ""
-                await notify(f"⚠️ {model} failed ({short}).{nxt}")
-    raise Exception("All Gemini models failed:\n" + "\n".join(errors))
+
+    for round_num in range(1, GEMINI_FULL_RETRY_ROUNDS + 1):
+        if round_num > 1 and notify:
+            await notify(f"🔁 Retrying all Gemini models (pass {round_num}/{GEMINI_FULL_RETRY_ROUNDS})...")
+            await asyncio.sleep(3)
+
+        for i, model in enumerate(models):
+            try:
+                if notify:
+                    await notify(f"⚡ Updating observation with {model} (pass {round_num}/{GEMINI_FULL_RETRY_ROUNDS})...")
+                resp = await _call_gemini_fast(model, contents, json_mode=False, timeout=GEMINI_MODEL_TIMEOUT_SEC)
+                if not resp.text:
+                    raise Exception("empty response")
+                out_lines = []
+                for line in resp.text.strip().splitlines():
+                    m = re.match(r"^(-\s*\*([^*]+)\*:\s*)(.+)$", line)
+                    if m:
+                        out_lines.append(f"{m.group(1)}{format_report_numbers(m.group(2), m.group(3))}")
+                    else:
+                        out_lines.append(line)
+                return "\n".join(out_lines)
+            except Exception as e:
+                short = re.sub(r"\s+", " ", str(e))[:160]
+                errors.append(f"[Pass {round_num}] {model}: {short}")
+                if notify:
+                    nxt = f" Trying {models[i + 1]}..." if i + 1 < len(models) else ""
+                    await notify(f"⚠️ {model} failed ({short}).{nxt}")
+
+    raise Exception("All Gemini models failed after retrying:\n" + "\n".join(errors))
 
 
 def param_info(data, key):
@@ -1948,6 +2240,28 @@ def build_report(well, period_label, data, decisions):
     return "\n".join(lines)
 
 
+async def send_chart_and_excels(bot, chat_id, update_msg, image_path, excel_files, caption):
+    """Send the chart screenshot and any exported Excel files to the Telegram chat."""
+    with open(image_path, "rb") as photo:
+        if update_msg:
+            await update_msg.reply_photo(photo=photo, caption=caption)
+        else:
+            await bot.send_photo(chat_id, photo=photo, caption=caption)
+
+    for xl_path in excel_files or []:
+        if os.path.exists(xl_path):
+            try:
+                with open(xl_path, "rb") as doc:
+                    await bot.send_document(
+                        chat_id,
+                        document=doc,
+                        filename=os.path.basename(xl_path),
+                        caption=f"📄 Exported data sheet: {os.path.basename(xl_path)}",
+                    )
+            except Exception:
+                pass
+
+
 async def resolve_decisions(
     bot,
     chat_id,
@@ -1955,6 +2269,8 @@ async def resolve_decisions(
     period_label,
     data,
     image_path,
+    excel_files=None,
+    export_dir=None,
     page=None,
     period=None,
     remove_pip=False,
@@ -1975,11 +2291,12 @@ async def resolve_decisions(
 
     decisions = _init_decisions()
     extra_wait = 0
+    excel_files = excel_files or []
 
     while True:
         pending = [k for k in PARAM_ORDER if param_state(data, k) != "ok" and k not in decisions]
         if not pending:
-            return data, decisions, well, period_label
+            return data, decisions, well, period_label, excel_files
 
         key = pending[0]
         status, ptext, note = param_info(data, key)
@@ -2023,7 +2340,7 @@ async def resolve_decisions(
         elif action == "reload":
             extra_wait += 5
             try:
-                well, period_label = await capture_chart_advanced(
+                well, period_label, excel_files = await capture_chart_advanced(
                     well,
                     page,
                     notify,
@@ -2033,22 +2350,23 @@ async def resolve_decisions(
                     remove_pip=remove_pip,
                     remove_pd=remove_pd,
                     extra_wait=extra_wait,
+                    export_dir=export_dir,
                 )
-                with open(image_path, "rb") as photo:
-                    if update_msg:
-                        await update_msg.reply_photo(
-                            photo=photo, caption=f"📊 Reloaded chart (+{extra_wait}s wait) for well: {well}"
-                        )
-                    else:
-                        await bot.send_photo(
-                            chat_id, photo=photo, caption=f"📊 Reloaded chart (+{extra_wait}s wait) for well: {well}"
-                        )
+                await send_chart_and_excels(
+                    bot,
+                    chat_id,
+                    update_msg,
+                    image_path,
+                    excel_files,
+                    caption=f"📊 Reloaded chart (+{extra_wait}s wait) for well: {well} ({period_label})",
+                )
                 data = await analyze_with_ai(
                     image_path,
                     well,
                     period_label=period_label,
                     remove_pip=remove_pip,
                     remove_pd=remove_pd,
+                    excel_files=excel_files,
                     notify=notify,
                 )
                 decisions = _init_decisions()
@@ -2064,6 +2382,7 @@ async def resolve_decisions(
                     period_label=period_label,
                     remove_pip=remove_pip,
                     remove_pd=remove_pd,
+                    excel_files=excel_files,
                     notify=notify,
                 )
                 decisions = _init_decisions()
@@ -2412,8 +2731,8 @@ async def run_edit_alarm_settings(bot, chat_id, well, param_name, page, notify, 
 # =====================================================================================
 @asynccontextmanager
 async def browser_page(debug_path):
-    """A Chromium page (re-using the saved session). Saves the session on success and an
-    error screenshot on failure."""
+    """A Chromium page (re-using the saved session, with downloads enabled). Saves the session on success
+    and an error screenshot on failure."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -2429,6 +2748,7 @@ async def browser_page(debug_path):
             viewport={"width": VIEWPORT_W, "height": VIEWPORT_H},
             device_scale_factor=2,
             user_agent=USER_AGENT,
+            accept_downloads=True,
         )
         if os.path.exists(STATE_FILE):
             ctx_kwargs["storage_state"] = STATE_FILE
@@ -2514,16 +2834,16 @@ async def run_grid_flow(bot, chat_id, well, notify, debug_path):
             await bot.send_message(chat_id, format_grid_message(well, results), parse_mode="HTML")
 
 
-async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_path):
+async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_path, export_dir):
     """Open Trends chart, verify well via breadcrumb, read the true well name from the chart header,
-    optionally remove PIP/PD, estimate the period ('Last Day' for 1 D, or hours), and analyze with Gemini."""
+    optionally remove PIP/PD, export & unzip the Excel sheet, and analyze both screenshot + Excel with Gemini."""
     period = await pick_period(bot, chat_id, well)
     remove_pip, remove_pd = await ask_curves_to_remove(bot, chat_id, well)
     extra_wait = 0
     login_ui = LoginUI(bot, chat_id)
 
     async with browser_page(debug_path) as page:
-        chart_well, period_label = await capture_chart_advanced(
+        chart_well, period_label, excel_files = await capture_chart_advanced(
             well,
             page,
             notify,
@@ -2533,13 +2853,18 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
             remove_pip=remove_pip,
             remove_pd=remove_pd,
             extra_wait=extra_wait,
+            export_dir=export_dir,
         )
 
         while True:
-            with open(path, "rb") as photo:
-                await update_msg.reply_photo(
-                    photo=photo, caption=f"📊 Chart for well: {chart_well} ({period_label})"
-                )
+            await send_chart_and_excels(
+                bot,
+                chat_id,
+                update_msg,
+                path,
+                excel_files,
+                caption=f"📊 Chart for well: {chart_well} ({period_label})",
+            )
 
             data = await analyze_with_ai(
                 path,
@@ -2547,15 +2872,18 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
                 period_label=period_label,
                 remove_pip=remove_pip,
                 remove_pd=remove_pd,
+                excel_files=excel_files,
                 notify=notify,
             )
-            data, decisions, chart_well, period_label = await resolve_decisions(
+            data, decisions, chart_well, period_label, excel_files = await resolve_decisions(
                 bot,
                 chat_id,
                 chart_well,
                 period_label,
                 data,
                 path,
+                excel_files=excel_files,
+                export_dir=export_dir,
                 page=page,
                 period=period,
                 remove_pip=remove_pip,
@@ -2598,7 +2926,13 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
                         r"(?s)^.+$",
                     )
                     report_text = await refine_report_with_ai(
-                        path, chart_well, period_label, report_text, followup, notify
+                        path,
+                        chart_well,
+                        period_label,
+                        report_text,
+                        followup,
+                        excel_files=excel_files,
+                        notify=notify,
                     )
                     await bot.send_message(chat_id, report_text)
                     await notify("✅ Observation updated")
@@ -2606,8 +2940,7 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
 
                 if next_action == "toggle_pip":
                     remove_pip = not remove_pip
-                    # Restart the full chart capture flow from the start so altered Y-axis/chart dimensions are measured fresh
-                    chart_well, period_label = await capture_chart_advanced(
+                    chart_well, period_label, excel_files = await capture_chart_advanced(
                         well,
                         page,
                         notify,
@@ -2617,13 +2950,13 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
                         remove_pip=remove_pip,
                         remove_pd=remove_pd,
                         extra_wait=extra_wait,
+                        export_dir=export_dir,
                     )
                     break
 
                 if next_action == "toggle_pd":
                     remove_pd = not remove_pd
-                    # Restart the full chart capture flow from the start so altered Y-axis/chart dimensions are measured fresh
-                    chart_well, period_label = await capture_chart_advanced(
+                    chart_well, period_label, excel_files = await capture_chart_advanced(
                         well,
                         page,
                         notify,
@@ -2633,12 +2966,13 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
                         remove_pip=remove_pip,
                         remove_pd=remove_pd,
                         extra_wait=extra_wait,
+                        export_dir=export_dir,
                     )
                     break
 
                 if next_action == "reload_chart":
                     extra_wait += 5
-                    chart_well, period_label = await capture_chart_advanced(
+                    chart_well, period_label, excel_files = await capture_chart_advanced(
                         well,
                         page,
                         notify,
@@ -2648,6 +2982,7 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
                         remove_pip=remove_pip,
                         remove_pd=remove_pd,
                         extra_wait=extra_wait,
+                        export_dir=export_dir,
                     )
                     break
 
@@ -2655,7 +2990,7 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
                     extra_wait = 0
                     period = await pick_period(bot, chat_id, chart_well)
                     remove_pip, remove_pd = await ask_curves_to_remove(bot, chat_id, chart_well)
-                    chart_well, period_label = await capture_chart_advanced(
+                    chart_well, period_label, excel_files = await capture_chart_advanced(
                         well,
                         page,
                         notify,
@@ -2665,6 +3000,7 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
                         remove_pip=remove_pip,
                         remove_pd=remove_pd,
                         extra_wait=0,
+                        export_dir=export_dir,
                     )
                     break
 
@@ -2709,13 +3045,14 @@ async def handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     token = str(next(_req_counter))
     path = f"{re.sub(r'[^A-Za-z0-9_-]', '_', well)}_{token}.png"
     debug_path = f"debug_error_{token}.png"
+    export_dir = f"export_{token}"
 
     try:
         view_choice = await pick_view(bot, chat_id, well)
         if view_choice == "grid":
             await run_grid_flow(bot, chat_id, well, notify, debug_path)
         else:
-            await run_trends_flow(bot, chat_id, well, update.message, notify, path, debug_path)
+            await run_trends_flow(bot, chat_id, well, update.message, notify, path, debug_path, export_dir)
 
         await notify("✅ Done")
 
@@ -2732,6 +3069,8 @@ async def handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for f in (path, debug_path):
             if os.path.exists(f):
                 os.remove(f)
+        if os.path.exists(export_dir):
+            shutil.rmtree(export_dir, ignore_errors=True)
         try:
             await bot.send_message(chat_id, f"🛑 Session ended for well: {well}.")
         except Exception:
@@ -2764,7 +3103,6 @@ def start_health_server():
 
 
 if __name__ == "__main__":
-    # Start the HTTP health server in a background thread so Render sees an open port
     threading.Thread(target=start_health_server, daemon=True).start()
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).concurrent_updates(True).build()
