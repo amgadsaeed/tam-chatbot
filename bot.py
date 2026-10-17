@@ -35,22 +35,28 @@ nest_asyncio.apply()
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GEMINI_KEY = os.environ["GEMINI_KEY"]
 
-# Models are tried in this order; if ALL fail, the entire list is retried again!
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-DEFAULT_FALLBACK_MODELS = (
-    "gemini-2.5-pro,"
-    "gemini-2.5-flash-lite,"
-    "gemini-2.0-flash,"
-    "gemini-2.0-flash-lite,"
-    "gemini-3.8-flash,"
-    "gemini-3.5-flash-lite"
-)
+# Primary model + active multimodal fallbacks (all support Image + Text -> JSON)
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+
+DEFAULT_FALLBACK_MODELS = ",".join([
+    # Gemini 3 Series (Active Stable & Preview Multimodal Models)
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3.1-pro-preview",
+
+    # Gemini 2.5 Series (Active Multimodal Models)
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash-lite",
+])
+
 GEMINI_FALLBACKS = [
     m.strip()
     for m in os.environ.get("GEMINI_FALLBACKS", DEFAULT_FALLBACK_MODELS).split(",")
     if m.strip()
 ]
-GEMINI_FULL_RETRY_ROUNDS = 2       # how many full passes through all models before giving up
+GEMINI_FULL_RETRY_ROUNDS = 2       # retries the entire list again if all models fail
 GEMINI_MODEL_TIMEOUT_SEC = 60      # max seconds per single model attempt
 
 # Login (Okta): accounts live in credentials.json (or CREDENTIALS_JSON env var)
