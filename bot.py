@@ -1,5 +1,6 @@
 import os
 import re
+import csv
 import json
 import shutil
 import zipfile
@@ -418,12 +419,16 @@ async def ask_curves_to_remove(bot, chat_id, well):
 
 
 async def pick_view(bot, chat_id, well):
-    """Trends chart (with analysis) or the Grid View > Facility Parameters table."""
+    """Ask whether the user wants Chart + Observation, Chart Screenshot Only, or Grid View."""
     value = await ask_choice(
         bot,
         chat_id,
         f"What do you need for {well}?",
-        [("📈 Trends chart + analysis", "trends"), ("🧾 Grid View (Facility Parameters)", "grid")],
+        [
+            ("📈 Chart + Observation (Excel + AI)", "trends_obs"),
+            ("🖼️ Chart screenshot only", "trends_only"),
+            ("🧾 Grid View (Facility Parameters)", "grid"),
+        ],
     )
     return value
 
@@ -1255,7 +1260,7 @@ async def apply_period(page, period, notify):
 
 
 # =====================================================================================
-# Trends: Export Chart Data (.zip -> .xlsx), Unzip, Parse for Gemini
+# Trends: Export Chart Data (.zip -> .xlsx), Unzip, Parse Exact Columns for Gemini
 # =====================================================================================
 async def _open_export_menu_and_click(page, item_selector: str, item_name: str, notify):
     """Click the Export Chart icon (id$='dataExport'), force its tooltip menu visible if needed,
@@ -1267,7 +1272,6 @@ async def _open_export_menu_and_click(page, item_selector: str, item_name: str, 
     await click(icon)
     await asyncio.sleep(1.0)
 
-    # Ensure the .tooltip-links dropdown is visible even if the click didn't toggle display:block
     try:
         await fr.evaluate("""() => {
             document.querySelectorAll('div.export-icon-trendchart .tooltip-links').forEach(d => {
@@ -1307,9 +1311,39 @@ def _unzip_and_collect_excels(downloaded_path: str, extract_dir: str) -> list:
     return excel_files
 
 
-def extract_excel_text_for_ai(excel_paths: list, max_chars: int = 35000) -> str:
-    """Read the exported Excel (.xlsx) or CSV files and format their contents as a clean text summary
-    for Gemini so it can see exact numerical readings alongside the chart image."""
+def _match_target_col(col_name: str):
+    """Match an Excel column header to one of the 6 target ESP parameters."""
+    c = re.sub(r"\s+", " ", (col_name or "").strip()).lower()
+    if "press-pump intake" in c or "(pi)" in c:
+        return "PIP", "Press-Pump Intake (Pi)[psi]"
+    if "press-pump discharge" in c:
+        return "PD", "Press-Pump Discharge[psi]"
+    if "pwr-motor amps ph b" in c or "motor amps" in c:
+        return "Motor Amp", "Pwr-Motor Amps Ph B[A]"
+    if "status-hz" in c:
+        return "Frequency (Hz)", "Status-Hz[Hz]"
+    if "temp-motor" in c:
+        return "Tm", "Temp-Motor[degF]"
+    if "vib-pump x" in c:
+        return "Vibration (Vx)", "Vib-Pump X axis[G]"
+    return None, None
+
+
+def _to_float(val):
+    if val is None:
+        return None
+    s = str(val).replace(",", "").strip()
+    if not s or s in ("-", "N/A", "null", "None"):
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def extract_excel_text_for_ai(excel_paths: list, max_chars: int = 40000) -> str:
+    """Read exported Excel/CSV files, compute exact Start/End/Min/Max stats for the 6 target columns,
+    and provide a full-period time-series table for Gemini."""
     if not excel_paths:
         return ""
 
@@ -1317,43 +1351,101 @@ def extract_excel_text_for_ai(excel_paths: list, max_chars: int = 35000) -> str:
     for path in excel_paths:
         fname = os.path.basename(path)
         try:
+            all_rows = []
             if path.lower().endswith(".csv"):
                 with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                    lines = [line.strip() for line in f if line.strip()]
-                if len(lines) > 250:
-                    head = lines[:120]
-                    tail = lines[-120:]
-                    body = "\n".join(head + [f"... ({len(lines) - 240} middle rows omitted) ..."] + tail)
-                else:
-                    body = "\n".join(lines)
-                chunks.append(f"=== File: {fname} ===\n{body}")
+                    for r in csv.reader(f):
+                        if any(c is not None and str(c).strip() != "" for c in r):
+                            all_rows.append(["" if c is None else str(c).strip() for c in r])
             else:
                 wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
                 for sheet_name in wb.sheetnames:
                     ws = wb[sheet_name]
-                    rows_txt = []
                     for row in ws.iter_rows(values_only=True):
-                        if any(cell is not None and str(cell).strip() != "" for cell in row):
-                            row_str = "\t".join("" if c is None else str(c).strip() for c in row)
-                            rows_txt.append(row_str)
-                    if not rows_txt:
-                        continue
-                    if len(rows_txt) > 250:
-                        # Include header + first 120 rows + last 120 rows so start, trend, and end are 100% exact
-                        selected = (
-                            rows_txt[:120]
-                            + [f"... ({len(rows_txt) - 240} middle rows omitted) ..."]
-                            + rows_txt[-120:]
-                        )
-                    else:
-                        selected = rows_txt
-                    chunks.append(f"=== File: {fname} | Sheet: {sheet_name} (Total rows: {len(rows_txt)}) ===\n" + "\n".join(selected))
+                        if any(c is not None and str(c).strip() != "" for c in row):
+                            all_rows.append(["" if c is None else str(c).strip() for c in row])
                 wb.close()
+
+            if not all_rows:
+                continue
+
+            # Locate the header row (the row containing parameter names like Press-Pump Intake or Status-Hz)
+            header_idx = 0
+            for idx, r in enumerate(all_rows[:20]):
+                joined = " ".join(r).lower()
+                if any(k in joined for k in ("status-hz", "temp-motor", "press-pump", "pwr-motor")):
+                    header_idx = idx
+                    break
+
+            headers = all_rows[header_idx]
+            data_rows = all_rows[header_idx + 1 :]
+
+            # Identify timestamp column (usually column 0) and relevant parameter columns
+            relevant_cols = {}  # col_idx -> (short_name, exact_header)
+            for c_idx, h in enumerate(headers):
+                short_name, canonical = _match_target_col(h)
+                if short_name:
+                    relevant_cols[c_idx] = (short_name, h or canonical)
+
+            # Compute exact summary statistics per parameter so older models never misread start/end/min/max
+            stats_lines = ["=== EXACT CALCULATED SUMMARY STATISTICS FROM EXCEL ==="]
+            for c_idx, (short_name, col_header) in relevant_cols.items():
+                pts = []
+                for r in data_rows:
+                    if c_idx < len(r):
+                        v = _to_float(r[c_idx])
+                        if v is not None:
+                            ts = r[0] if len(r) > 0 else ""
+                            pts.append((ts, v))
+                if pts:
+                    start_ts, start_v = pts[0]
+                    end_ts, end_v = pts[-1]
+                    min_ts, min_v = min(pts, key=lambda x: x[1])
+                    max_ts, max_v = max(pts, key=lambda x: x[1])
+                    all_zero = all(abs(x[1]) < 1e-6 for x in pts)
+                    stats_lines.append(
+                        f"- {short_name} (Excel column '{col_header}'): "
+                        f"First={start_v} (at {start_ts}) | Last={end_v} (at {end_ts}) | "
+                        f"Min={min_v} (at {min_ts}) | Max={max_v} (at {max_ts}) | "
+                        f"Points={len(pts)} | AllZero={all_zero}"
+                    )
+                else:
+                    stats_lines.append(f"- {short_name} (Excel column '{col_header}'): No numeric data rows found")
+
+            # Filter table columns to Timestamp (col 0) + the 6 relevant columns (if matched; otherwise keep all)
+            if relevant_cols:
+                keep_indices = [0] + sorted(i for i in relevant_cols.keys() if i != 0)
+            else:
+                keep_indices = list(range(len(headers)))
+
+            def _fmt_row(r):
+                return "\t".join(r[i] if i < len(r) else "" for i in keep_indices)
+
+            table_header = _fmt_row(headers)
+
+            # Evenly sample up to 240 rows across the ENTIRE dataset so mid-period spikes/shutdowns are always visible
+            max_sample = 240
+            if len(data_rows) > max_sample:
+                step = (len(data_rows) - 1) / float(max_sample - 1)
+                sampled_indices = sorted({round(i * step) for i in range(max_sample)})
+                sampled_rows = [_fmt_row(data_rows[i]) for i in sampled_indices]
+                table_title = f"=== EXCEL TIME-SERIES DATA ({len(sampled_rows)} evenly-spaced rows out of {len(data_rows)} total) ==="
+            else:
+                sampled_rows = [_fmt_row(r) for r in data_rows]
+                table_title = f"=== EXCEL TIME-SERIES DATA (All {len(data_rows)} rows) ==="
+
+            chunks.append(
+                f"=== File: {fname} ===\n"
+                + "\n".join(stats_lines)
+                + f"\n\n{table_title}\n"
+                + table_header
+                + "\n"
+                + "\n".join(sampled_rows)
+            )
         except Exception as e:
             chunks.append(f"=== File: {fname} (could not parse: {e}) ===")
 
-    combined = "\n\n".join(chunks)
-    return combined[:max_chars]
+    return "\n\n".join(chunks)[:max_chars]
 
 
 async def export_and_download_chart_excel(page, notify, extract_dir: str) -> list:
@@ -1364,7 +1456,6 @@ async def export_and_download_chart_excel(page, notify, extract_dir: str) -> lis
 
     await notify("📥 Starting chart data export...")
 
-    # Attach a listener in case clicking "Export Data" triggers an immediate browser download
     immediate_dl_fut = asyncio.get_running_loop().create_future()
 
     def _on_dl(dl):
@@ -1375,7 +1466,6 @@ async def export_and_download_chart_excel(page, notify, extract_dir: str) -> lis
     try:
         await _open_export_menu_and_click(page, EXPORT_DATA_LI_SEL, "Export Data", notify)
 
-        # Check for up to 6 seconds whether an immediate download started OR the Export Notification dialog appeared
         ok_btn = None
         for _ in range(12):
             if immediate_dl_fut.done():
@@ -1403,16 +1493,13 @@ async def export_and_download_chart_excel(page, notify, extract_dir: str) -> lis
             await notify(f"⏳ Waiting {EXPORT_BG_WAIT_SEC}s for the export file to be created...")
             await asyncio.sleep(EXPORT_BG_WAIT_SEC)
 
-            # Open the Export menu again and click "Export Status"
             await _open_export_menu_and_click(page, EXPORT_STATUS_LI_SEL, "Export Status", notify)
             await asyncio.sleep(3.0)
 
-            # Wait for the Export Status table and the first row's download button (#downloladStatusTd0)
             status_fr, dl_el = await find_in_frames(page, EXPORT_FIRST_ROW_DL_SEL, timeout=25, need_size=True)
             if not dl_el:
                 raise Exception("Export Status table or first row download icon (#downloladStatusTd0) was not found.")
 
-            # If the first row is still "In Progress", poll up to 30 extra seconds until its download icon is ready
             img_el = await status_fr.query_selector(
                 'td#downloladStatusTd0 img[onclick*="downloadExportedFile"]'
             ) or dl_el
@@ -1426,7 +1513,6 @@ async def export_and_download_chart_excel(page, notify, extract_dir: str) -> lis
             await dl.save_as(downloaded_zip_path)
             await notify(f"✅ Downloaded export archive: {fname}")
 
-            # Close the Export Status dialog if a close button is present
             try:
                 close_dlg_btn = await status_fr.query_selector(
                     'div[aria-describedby$="exportDownlaodStatusDiv"] button.ui-dialog-titlebar-close'
@@ -1642,7 +1728,7 @@ async def render_and_screenshot_chart(
     export_dir=None,
 ):
     """Apply `period`, toggle PIP/PD, place 2 freeze points, screenshot the chart,
-    and export/unzip the Excel data sheet for the current view."""
+    and optionally export/unzip the Excel data sheet for the current view."""
     if reload_tab:
         await notify(f"🔃 Reloading Trends tab (with +{extra_wait}s extra wait)...")
         _, tab = await find_in_frames(page, TRENDS_TAB, timeout=15)
@@ -1696,7 +1782,7 @@ async def render_and_screenshot_chart(
     crop_right(out_path, CROP_RIGHT_PX)
     await notify("📸 Chart screenshot captured")
 
-    # Export and download the Excel data sheet for the current view
+    # Export and download the Excel data sheet for the current view (if export_dir is given)
     excel_files = []
     if export_dir:
         try:
@@ -1960,23 +2046,30 @@ def build_prompt(
     excel_text: str = "",
 ) -> str:
     pip_instruction = (
-        '- "PIP" was intentionally hidden/removed by the user; set "PIP" status to "not_visible" with empty text.'
+        '- "PIP": Intentionally hidden/removed by the user; set "PIP" status to "not_visible" with empty text.'
         if remove_pip
-        else '- "PIP"       = "Pump Intake Pressure" or "Press-Pump Intake"'
+        else '- "PIP"            = Excel column "Press-Pump Intake (Pi)[psi]"'
     )
     pd_instruction = (
-        '- "PD" was intentionally hidden/removed by the user; set "PD" status to "not_visible" with empty text.'
+        '- "PD": Intentionally hidden/removed by the user; set "PD" status to "not_visible" with empty text.'
         if remove_pd
-        else '- "PD"        = "Press-Pump Discharge"'
+        else '- "PD"             = Excel column "Press-Pump Discharge[psi]"'
+    )
+    source_rule = (
+        "CRITICAL INSTRUCTION: Base your entire observation, numbers, start/end values, ranges, spikes, and shutdowns "
+        "STRICTLY on the provided EXCEL FILE DATA below (do NOT guess numbers from the chart image when Excel data is present). "
+        "Use the chart image only to confirm which curves are visually displayed."
+        if excel_text
+        else "Analyze the attached ProductionLink chart image and describe what happened during the period shown."
     )
     excel_section = (
-        f"\n\nEXPORTED EXCEL DATA FOR THIS VIEW (use these exact numbers to make your readings 100% accurate):\n{excel_text}\n"
+        f"\n\nEXPORTED EXCEL DATA FOR THIS VIEW (PRIMARY SOURCE OF TRUTH):\n{excel_text}\n"
         if excel_text
         else ""
     )
     return f"""You are an ESP (Electric Submersible Pump) surveillance engineer.
-Analyze the attached ProductionLink chart image (and the exported Excel sheet data if provided below) for well {well}
-and describe what happened during the period shown on the chart ({period_label}).
+{source_rule}
+Well: {well} | Period: {period_label}.
 
 Return ONLY one JSON object (no markdown, no code fence) with exactly this structure:
 
@@ -1992,15 +2085,17 @@ Return ONLY one JSON object (no markdown, no code fence) with exactly this struc
   ]
 }}
 
-CURVE MAPPING (use the legend/labels on the chart and columns in the Excel sheet):
+EXACT EXCEL COLUMN MAPPING (MANDATORY):
 {pip_instruction}
 {pd_instruction}
-- "Motor Amp" = "Pwr-Motor Amps Ph B"
-- "Tm"        = "Temp-Motor"
+- "Motor Amp"      = Excel column "Pwr-Motor Amps Ph B[A]"
+- "Frequency (Hz)" = Excel column "Status-Hz[Hz]" (describe this inside the "Motor Amp" text!)
+- "Tm"             = Excel column "Temp-Motor[degF]"
+- "Vibration (Vx)" = Excel column "Vib-Pump X axis[G]" (put this inside "extras" if present and non-empty)
 
 STRICT EXCLUSIONS (DO NOT analyze or include these under any circumstances):
-- NEVER include "Vibration (Vy)" or "Vib-Pump Y axis".
-- NEVER include "Temp-Pump Intake" or "Pump Intake Temperature".
+- NEVER include "Vibration (Vy)" or "Vib-Pump Y axis[G]".
+- NEVER include "Temp-Pump Intake" or "Temp-Pump Intake[degF]".
 
 NUMBER ROUNDING & PRECISION RULES (MANDATORY):
 - "PIP" and "PD": NO fractions/decimals at all (round to whole integers, e.g. 2864 Psi, 1105 Psi).
@@ -2008,25 +2103,23 @@ NUMBER ROUNDING & PRECISION RULES (MANDATORY):
 - "Motor Amp", "Tm", and "Vibration (Vx)": AT MOST ONE decimal place (1 fraction digit, e.g. 40.2 A, 324.5 F, 0.1 G — round 0.12 G to 0.1 G).
 
 STATUS RULES:
-- "ok": you can read the parameter and describe it. Fill "text".
-- "not_visible": the curve for this parameter is not on the chart (or its legend tag is grayed out). Leave "text" empty and explain in "note".
-- "unreadable": the curve exists but the values cannot be read reliably. Leave "text" empty and explain in "note".
-- "zero": the curve is visible (active colored legend, not grayed out) and stays at 0 (flat on the zero line) for the WHOLE period.
+- "ok": the parameter has valid readings in the Excel data (and is not hidden). Fill "text" using the exact Excel values.
+- "not_visible": the parameter was removed/hidden or has no data column. Leave "text" empty and explain in "note".
+- "unreadable": values cannot be read reliably. Leave "text" empty and explain in "note".
+- "zero": all values for this parameter in the Excel column are 0 for the WHOLE period (AllZero=True).
   Put a short description in "text", for example "Constant at 0 Psi".
-- Never guess or invent numbers just to fill a parameter.
+- Never guess or invent numbers. Always use the First, Last, Min, Max, and time-series progression from the Excel file.
 
 STYLE OF "text" (no parameter name, no asterisks, no trailing period, units always included: Psi, A, F, G, Hz):
-- Trend: "Decreased from X Psi to Y Psi" / "Increased from X to Y F"
-- Range: "Varied between X & Y G" / "Fluctuated between X & Y"
-- Spike: add "& spiked up to Z" or "& dropped to Z" when relevant
-- Motor Amp must also describe the frequency, for example:
+- Trend: "Decreased from X Psi to Y Psi" / "Increased from X to Y F" / "Constant at X Psi"
+- Range: "Varied between X & Y G" / "Fluctuated between X & Y A"
+- Spike/Drop: add "& spiked up to Z" or "& dropped to Z" when the Excel time-series shows a notable spike or drop
+- Motor Amp must ALWAYS include Frequency from "Status-Hz[Hz]", for example:
   "Started at 52.7 A, then changed between 64.1 & 65.1 A while Frequency started at 43 Hz and increased to 50 Hz"
   or, if frequency did not change: "... while Frequency was constant at 45 Hz".
-  If no frequency curve is visible, describe only the amps.
-- If the well was shut down or restarted during the period, mention it briefly inside the relevant texts.
+- If the Excel data shows the well shut down (Amps and Hz dropping to 0) or restarted during the period, mention it briefly inside the relevant texts.
 
-"extras": other parameters clearly visible on the chart (for example Vibration (Vx)), EXCEPT "Vibration (Vy)" / "Vib-Pump Y axis" and "Temp-Pump Intake" which must NEVER be included.
-Use the same style. Leave the list empty if there are none. Do not put the four main parameters there.
+"extras": include "Vibration (Vx)" (from "Vib-Pump X axis[G]") here using the same style. Do not put the four main parameters or excluded parameters here.
 
 Write in English.{excel_section}"""
 
@@ -2138,10 +2231,10 @@ async def analyze_with_ai(
 async def refine_report_with_ai(
     image_path, well, period_label, current_report, user_instruction, excel_files=None, notify=None
 ):
-    """Refine the existing WhatsApp report using the chart image, exported Excel data, and user's follow-up prompt."""
+    """Refine the existing WhatsApp report using the Excel data, chart image, and user's follow-up prompt."""
     excel_text = extract_excel_text_for_ai(excel_files or [])
     excel_section = (
-        f"\n\nEXPORTED EXCEL DATA FOR THIS VIEW:\n{excel_text}\n"
+        f"\n\nEXPORTED EXCEL DATA FOR THIS VIEW (PRIMARY SOURCE OF TRUTH):\n{excel_text}\n"
         if excel_text
         else ""
     )
@@ -2153,13 +2246,22 @@ Here is the current well performance report for well {well}:
 The user wants to edit/update this observation with the following instruction:
 "{user_instruction}"
 
+EXACT EXCEL COLUMN MAPPING:
+- Pwr-Motor Amps Ph B[A] is for Motor Amp
+- Status-Hz[Hz] is for Frequency (Hz)
+- Press-Pump Intake (Pi)[psi] is for PIP
+- Press-Pump Discharge[psi] is for PD
+- Temp-Motor[degF] is for Tm
+- Vib-Pump X axis[G] is for Vibration (Vx)
+
 STRICT RULES:
-1. Never include "Vibration (Vy)" / "Vib-Pump Y axis" or "Temp-Pump Intake" unless explicitly requested.
-2. Rounding rules:
+1. Base all numerical readings strictly on the exported Excel data below (not visual guessing from the screenshot).
+2. Never include "Vibration (Vy)" / "Vib-Pump Y axis" or "Temp-Pump Intake" unless explicitly requested.
+3. Rounding rules:
    - PIP, PD, and Frequency (Hz): whole numbers only (NO decimals, e.g. 2864 Psi, 45 Hz).
    - Motor Amp, Tm, and Vibration (Vx): maximum 1 decimal place (e.g. 40.2 A, 324.5 F, 0.1 G).
 
-Using the attached chart image, the exported Excel data (if provided), and the user's instruction, return ONLY the updated report in the exact same WhatsApp format (starting with *{well} | Well Performance Update ({period_label})* and using bullet points `- *Parameter*: ...`). Do not wrap it in markdown code fences or add extra commentary.{excel_section}"""
+Return ONLY the updated report in the exact same WhatsApp format (starting with *{well} | Well Performance Update ({period_label})* and using bullet points `- *Parameter*: ...`). Do not wrap it in markdown code fences or add extra commentary.{excel_section}"""
 
     with open(image_path, "rb") as f:
         contents = [types.Part.from_bytes(data=f.read(), mime_type="image/png"), prompt]
@@ -2840,9 +2942,11 @@ async def run_grid_flow(bot, chat_id, well, notify, debug_path):
             await bot.send_message(chat_id, format_grid_message(well, results), parse_mode="HTML")
 
 
-async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_path, export_dir):
+async def run_trends_flow(
+    bot, chat_id, well, update_msg, notify, path, debug_path, export_dir, include_observation=True
+):
     """Open Trends chart, verify well via breadcrumb, read the true well name from the chart header,
-    optionally remove PIP/PD, export & unzip the Excel sheet, and analyze both screenshot + Excel with Gemini."""
+    optionally remove PIP/PD, and either send Screenshot Only or Screenshot + Excel + Gemini Observation."""
     period = await pick_period(bot, chat_id, well)
     remove_pip, remove_pd = await ask_curves_to_remove(bot, chat_id, well)
     extra_wait = 0
@@ -2859,7 +2963,7 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
             remove_pip=remove_pip,
             remove_pd=remove_pd,
             extra_wait=extra_wait,
-            export_dir=export_dir,
+            export_dir=export_dir if include_observation else None,
         )
 
         while True:
@@ -2868,41 +2972,45 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
                 chat_id,
                 update_msg,
                 path,
-                excel_files,
+                excel_files if include_observation else [],
                 caption=f"📊 Chart for well: {chart_well} ({period_label})",
             )
 
-            data = await analyze_with_ai(
-                path,
-                chart_well,
-                period_label=period_label,
-                remove_pip=remove_pip,
-                remove_pd=remove_pd,
-                excel_files=excel_files,
-                notify=notify,
-            )
-            data, decisions, chart_well, period_label, excel_files = await resolve_decisions(
-                bot,
-                chat_id,
-                chart_well,
-                period_label,
-                data,
-                path,
-                excel_files=excel_files,
-                export_dir=export_dir,
-                page=page,
-                period=period,
-                remove_pip=remove_pip,
-                remove_pd=remove_pd,
-                update_msg=update_msg,
-                notify=notify,
-                login_ui=login_ui,
-            )
-            report_text = build_report(chart_well, period_label, data, decisions)
-            await bot.send_message(chat_id, report_text)
-            await notify("✅ Analysis ready")
+            report_text = None
+            if include_observation:
+                data = await analyze_with_ai(
+                    path,
+                    chart_well,
+                    period_label=period_label,
+                    remove_pip=remove_pip,
+                    remove_pd=remove_pd,
+                    excel_files=excel_files,
+                    notify=notify,
+                )
+                data, decisions, chart_well, period_label, excel_files = await resolve_decisions(
+                    bot,
+                    chat_id,
+                    chart_well,
+                    period_label,
+                    data,
+                    path,
+                    excel_files=excel_files,
+                    export_dir=export_dir,
+                    page=page,
+                    period=period,
+                    remove_pip=remove_pip,
+                    remove_pd=remove_pd,
+                    update_msg=update_msg,
+                    notify=notify,
+                    login_ui=login_ui,
+                )
+                report_text = build_report(chart_well, period_label, data, decisions)
+                await bot.send_message(chat_id, report_text)
+                await notify("✅ Analysis ready")
+            else:
+                await notify("✅ Chart screenshot sent (screenshot-only mode)")
 
-            # Post-report options loop
+            # Post-chart / post-report options loop
             while True:
                 pip_toggle_label = (
                     "📈 Restore PIP on chart" if remove_pip else "🚫 Remove PIP from chart"
@@ -2910,18 +3018,72 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
                 pd_toggle_label = (
                     "📈 Restore PD on chart" if remove_pd else "🚫 Remove PD from chart"
                 )
+                menu_options = [
+                    ("🔃 Reload chart & resend screenshot (+5s wait)", "reload_chart"),
+                    ("🗓 Edit chart period", "edit_period"),
+                    (pip_toggle_label, "toggle_pip"),
+                    (pd_toggle_label, "toggle_pd"),
+                ]
+                if include_observation:
+                    menu_options.append(("💬 Edit observation with Gemini", "edit_gemini"))
+                else:
+                    menu_options.append(("📝 Generate observation for this chart (Excel + AI)", "gen_obs"))
+
                 next_action = await ask_choice(
                     bot,
                     chat_id,
                     f"What would you like to do next for {chart_well}?",
-                    [
-                        ("🔃 Reload chart & resend screenshot (+5s wait)", "reload_chart"),
-                        ("🗓 Edit chart period", "edit_period"),
-                        (pip_toggle_label, "toggle_pip"),
-                        (pd_toggle_label, "toggle_pd"),
-                        ("💬 Edit observation with Gemini", "edit_gemini"),
-                    ],
+                    menu_options,
                 )
+
+                if next_action == "gen_obs":
+                    include_observation = True
+                    try:
+                        shutil.rmtree(export_dir, ignore_errors=True)
+                        excel_files = await export_and_download_chart_excel(page, notify, export_dir)
+                        for xl_path in excel_files or []:
+                            if os.path.exists(xl_path):
+                                with open(xl_path, "rb") as doc:
+                                    await bot.send_document(
+                                        chat_id,
+                                        document=doc,
+                                        filename=os.path.basename(xl_path),
+                                        caption=f"📄 Exported data sheet: {os.path.basename(xl_path)}",
+                                    )
+                    except Exception as e:
+                        await notify(f"⚠️ Could not export Excel sheet: {str(e)[:200]} (analyzing screenshot)")
+                        excel_files = []
+
+                    data = await analyze_with_ai(
+                        path,
+                        chart_well,
+                        period_label=period_label,
+                        remove_pip=remove_pip,
+                        remove_pd=remove_pd,
+                        excel_files=excel_files,
+                        notify=notify,
+                    )
+                    data, decisions, chart_well, period_label, excel_files = await resolve_decisions(
+                        bot,
+                        chat_id,
+                        chart_well,
+                        period_label,
+                        data,
+                        path,
+                        excel_files=excel_files,
+                        export_dir=export_dir,
+                        page=page,
+                        period=period,
+                        remove_pip=remove_pip,
+                        remove_pd=remove_pd,
+                        update_msg=update_msg,
+                        notify=notify,
+                        login_ui=login_ui,
+                    )
+                    report_text = build_report(chart_well, period_label, data, decisions)
+                    await bot.send_message(chat_id, report_text)
+                    await notify("✅ Analysis ready")
+                    continue
 
                 if next_action == "edit_gemini":
                     followup = await ask_text(
@@ -2956,7 +3118,7 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
                         remove_pip=remove_pip,
                         remove_pd=remove_pd,
                         extra_wait=extra_wait,
-                        export_dir=export_dir,
+                        export_dir=export_dir if include_observation else None,
                     )
                     break
 
@@ -2972,7 +3134,7 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
                         remove_pip=remove_pip,
                         remove_pd=remove_pd,
                         extra_wait=extra_wait,
-                        export_dir=export_dir,
+                        export_dir=export_dir if include_observation else None,
                     )
                     break
 
@@ -2988,7 +3150,7 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
                         remove_pip=remove_pip,
                         remove_pd=remove_pd,
                         extra_wait=extra_wait,
-                        export_dir=export_dir,
+                        export_dir=export_dir if include_observation else None,
                     )
                     break
 
@@ -3006,7 +3168,7 @@ async def run_trends_flow(bot, chat_id, well, update_msg, notify, path, debug_pa
                         remove_pip=remove_pip,
                         remove_pd=remove_pd,
                         extra_wait=0,
-                        export_dir=export_dir,
+                        export_dir=export_dir if include_observation else None,
                     )
                     break
 
@@ -3058,7 +3220,18 @@ async def handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if view_choice == "grid":
             await run_grid_flow(bot, chat_id, well, notify, debug_path)
         else:
-            await run_trends_flow(bot, chat_id, well, update.message, notify, path, debug_path, export_dir)
+            include_obs = (view_choice == "trends_obs")
+            await run_trends_flow(
+                bot,
+                chat_id,
+                well,
+                update.message,
+                notify,
+                path,
+                debug_path,
+                export_dir,
+                include_observation=include_obs,
+            )
 
         await notify("✅ Done")
 
