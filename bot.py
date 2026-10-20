@@ -2652,7 +2652,7 @@ async def run_demand_scan(bot, chat_id, well, page, notify, debug_path):
 
 async def run_edit_alarm_settings(bot, chat_id, well, param_name, page, notify, debug_path):
     """Click Edit Alarm Settings -> screenshot popup -> ask which Threshold Settings to update ->
-    type new values -> send preview screenshot for approval -> Save or Close."""
+    type new values -> send preview screenshot for approval -> Save or Close (Optimized for speed)."""
     await notify(f"🚨 Opening Edit Alarm Settings for {param_name}...")
     _, edit_btn = await find_in_frames(
         page, '#exceptionSettingAnchor, a[title="Edit Alarm Settings"], a[onclick*="setExceptionSettingsParameters"]', timeout=15
@@ -2660,7 +2660,7 @@ async def run_edit_alarm_settings(bot, chat_id, well, param_name, page, notify, 
     if not edit_btn:
         raise Exception("Edit Alarm Settings button (#exceptionSettingAnchor) was not found.")
     await click(edit_btn)
-    await asyncio.sleep(4)
+    await asyncio.sleep(1.0)  # WAS: 4s (find_in_frames below polls automatically)
 
     _, dlg_el = await find_in_frames(
         page, 'div[aria-describedby="prodExceptionSettingsDiv"], #prodExceptionSettingsDiv', timeout=20, need_size=True
@@ -2669,11 +2669,15 @@ async def run_edit_alarm_settings(bot, chat_id, well, param_name, page, notify, 
         raise Exception("Alarm Settings popup (#prodExceptionSettingsDiv) did not appear.")
 
     alarm_frame = None
-    for _ in range(20):
+    for _ in range(40):  # Poll every 0.3s (WAS: 1.0s) until the iframe buttons are ready
         for fr in page.frames:
             if "alarmSettings.do" in (fr.url or "") or fr.name == "prodExceptionSettingsFrame":
-                alarm_frame = fr
-                break
+                try:
+                    if await fr.query_selector("#setAlarmSettingsButton, #closeAlarmSettingsButton"):
+                        alarm_frame = fr
+                        break
+                except Exception:
+                    pass
             try:
                 if await fr.query_selector("#setAlarmSettingsButton, #closeAlarmSettingsButton"):
                     alarm_frame = fr
@@ -2682,12 +2686,12 @@ async def run_edit_alarm_settings(bot, chat_id, well, param_name, page, notify, 
                 pass
         if alarm_frame:
             break
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.3)
 
     if not alarm_frame:
         raise Exception("Could not locate the inner Alarm Settings iframe (#prodExceptionSettingsFrame).")
 
-    await asyncio.sleep(2)
+    await asyncio.sleep(0.5)  # WAS: 2s (buttons are already in the DOM)
 
     async def send_popup_screenshot(caption):
         shot = debug_path.replace("debug_error", "alarm_settings")
@@ -2788,13 +2792,13 @@ async def run_edit_alarm_settings(bot, chat_id, well, param_name, page, notify, 
         await inp_el.evaluate("e => { e.click(); e.focus(); e.value = ''; }")
         await page.keyboard.press("Control+A")
         await page.keyboard.press("Delete")
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.1)  # WAS: 0.3s
         if new_val:
-            await page.keyboard.type(new_val, delay=60)
+            await page.keyboard.type(new_val, delay=15)  # WAS: delay=60
         await inp_el.evaluate(
             "e => { e.dispatchEvent(new Event('input', {bubbles:true})); e.dispatchEvent(new Event('change', {bubbles:true})); }"
         )
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.15)  # WAS: 0.5s
 
         f["value"] = await inp_el.input_value()
         await notify(f"✏️ Set '{f['label']}' → '{f['value']}'")
@@ -2819,8 +2823,8 @@ async def run_edit_alarm_settings(bot, chat_id, well, param_name, page, notify, 
         if not save_btn:
             raise Exception("Save button (#setAlarmSettingsButton) was not found.")
         await click(save_btn)
-        await asyncio.sleep(4)
-        await wait_loading_dialog_gone(page, notify, appear_timeout=4, disappear_timeout=60)
+        await asyncio.sleep(1.0)  # WAS: 4s
+        await wait_loading_dialog_gone(page, notify, appear_timeout=1.5, disappear_timeout=60)
         await bot.send_message(chat_id, f"✅ Alarm Settings saved for {param_name}.")
     else:
         await notify("❎ Clicking Close (#closeAlarmSettingsButton)...")
@@ -2830,7 +2834,7 @@ async def run_edit_alarm_settings(bot, chat_id, well, param_name, page, notify, 
         if not close_btn:
             raise Exception("Close button (#closeAlarmSettingsButton) was not found.")
         await click(close_btn)
-        await asyncio.sleep(2)
+        await asyncio.sleep(0.5)  # WAS: 2s
         await bot.send_message(chat_id, f"❎ Alarm Settings closed without saving for {param_name}.")
 
 
@@ -2935,8 +2939,8 @@ async def run_grid_flow(bot, chat_id, well, notify, debug_path):
                 _, fac_tab = await find_in_frames(page, FACILITY_TAB, timeout=15)
                 if fac_tab:
                     await click(fac_tab)
-                    await asyncio.sleep(3)
-                    await wait_loading_dialog_gone(page, notify, appear_timeout=3, disappear_timeout=45)
+                    await asyncio.sleep(1.0)  # WAS: 3s
+                    await wait_loading_dialog_gone(page, notify, appear_timeout=1.2, disappear_timeout=45)  # WAS: appear_timeout=3
 
             results = await collect_grid_params(page, notify)
             await bot.send_message(chat_id, format_grid_message(well, results), parse_mode="HTML")
