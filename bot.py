@@ -1021,30 +1021,51 @@ def _parse_any_dt(s: str):
     return None
 
 
-def _format_hours_half(total_hours: float) -> str:
-    """Round `total_hours` to the nearest 0.5 hour and format as 'Last X Hours' or 'Last X.5 Hours'."""
-    half_steps = max(1, round(total_hours * 2))
-    val = half_steps / 2.0
-
-    if val.is_integer():
-        whole = int(val)
-        unit = "Hour" if whole == 1 else "Hours"
-        return f"Last {whole} {unit}"
-    else:
+def _format_period_duration(total_hours: float) -> str:
+    """If < 24 hours, format in hours (nearest 0.5h).
+    If >= 24 hours, estimate in days (nearest 0.5d, or 'Last Day' for 1 day)."""
+    if total_hours < 24.0:
+        half_steps = max(1, round(total_hours * 2))
+        val = half_steps / 2.0
+        if val.is_integer():
+            whole = int(val)
+            unit = "Hour" if whole == 1 else "Hours"
+            return f"Last {whole} {unit}"
         return f"Last {val:.1f} Hours"
+
+    # 24 hours or more -> estimate to days (rounded to nearest 0.5 day)
+    days_raw = total_hours / 24.0
+    half_day_steps = max(2, round(days_raw * 2))
+    days_val = half_day_steps / 2.0
+
+    if days_val == 1.0:
+        return "Last Day"
+    elif days_val.is_integer():
+        return f"Last {int(days_val)} Days"
+    else:
+        return f"Last {days_val:.1f} Days"
 
 
 def compute_period_label(period: dict, range_text: str = "") -> str:
-    """Return 'Last Day' whenever the user chose the '1 D' preset (even if > 24h),
-    otherwise estimate the period in hours (rounded to 0.5h)."""
+    """Return 'Last Day' for 1 D preset, hours if < 24h, or estimated days if >= 24h."""
     if period and period.get("type") == "preset":
         key = re.sub(r"\s+", "", period.get("label", "")).upper()
-        if key == "1D":
-            return "Last Day"
+        preset_map = {
+            "1D": "Last Day",
+            "3D": "Last 3 Days",
+            "1W": "Last 7 Days",
+            "2W": "Last 14 Days",
+            "1M": "Last 30 Days",
+            "2M": "Last 60 Days",
+            "1Y": "Last 365 Days",
+        }
+        if key in preset_map:
+            return preset_map[key]
 
     if period and period.get("type") == "default":
         return "Last Day"
 
+    # Parse actual timestamps from the chart header range text
     if range_text:
         clean_rng = re.sub(r"\(.*?\)", "", range_text).strip()
         parts = [p.strip() for p in re.split(r"\s+-\s+|\s+to\s+", clean_rng) if p.strip()]
@@ -1052,7 +1073,15 @@ def compute_period_label(period: dict, range_text: str = "") -> str:
             dt1, dt2 = _parse_any_dt(parts[0]), _parse_any_dt(parts[1])
             if dt1 and dt2 and dt2 > dt1:
                 hours = (dt2 - dt1).total_seconds() / 3600.0
-                return _format_hours_half(hours)
+                return _format_period_duration(hours)
+
+    # Fallback to user-selected custom start/end
+    if period and period.get("type") == "custom" and period.get("start") and period.get("end"):
+        hours = (period["end"] - period["start"]).total_seconds() / 3600.0
+        if hours > 0:
+            return _format_period_duration(hours)
+
+    return "Last Day"
 
     if period and period.get("type") == "custom" and period.get("start") and period.get("end"):
         hours = (period["end"] - period["start"]).total_seconds() / 3600.0
@@ -1342,8 +1371,8 @@ def _to_float(val):
 
 
 def extract_excel_text_for_ai(excel_paths: list, max_chars: int = 40000) -> str:
-    """Read exported Excel/CSV files (with read_only=False so ProductionLink's dimension tag doesn't
-    truncate rows), compute exact Start/End/Min/Max stats, and build per-parameter time series."""
+    """Read exported Excel/CSV files (with read_only=False), compute exact Start/End/Min/Max
+    plus chronological phase breakdowns, and build per-parameter time series."""
     if not excel_paths:
         return ""
 
@@ -1358,8 +1387,6 @@ def extract_excel_text_for_ai(excel_paths: list, max_chars: int = 40000) -> str:
                         if any(c is not None and str(c).strip() != "" for c in r):
                             all_rows.append(["" if c is None else str(c).strip() for c in r])
             else:
-                # CRITICAL: read_only=False is required because ProductionLink .xlsx files
-                # have a broken dimension header that causes read_only=True to read only cell A1!
                 wb = openpyxl.load_workbook(path, data_only=True, read_only=False)
                 for sheet_name in wb.sheetnames:
                     ws = wb[sheet_name]
@@ -1371,7 +1398,6 @@ def extract_excel_text_for_ai(excel_paths: list, max_chars: int = 40000) -> str:
             if not all_rows:
                 continue
 
-            # Locate the header row
             header_idx = 0
             for idx, r in enumerate(all_rows[:20]):
                 joined = " ".join(r).lower()
@@ -1382,13 +1408,13 @@ def extract_excel_text_for_ai(excel_paths: list, max_chars: int = 40000) -> str:
             headers = all_rows[header_idx]
             data_rows = all_rows[header_idx + 1 :]
 
-            relevant_cols = {}  # col_idx -> (short_name, exact_header)
+            relevant_cols = {}
             for c_idx, h in enumerate(headers):
                 short_name, canonical = _match_target_col(h)
                 if short_name:
                     relevant_cols[c_idx] = (short_name, h or canonical)
 
-            stats_lines = ["=== EXACT CALCULATED SUMMARY STATISTICS FROM EXCEL ==="]
+            stats_lines = ["=== EXACT CALCULATED SUMMARY & CHRONOLOGICAL PHASES FROM EXCEL ==="]
             per_param_series = ["=== SAMPLED TIME-SERIES PER PARAMETER (NON-EMPTY READINGS) ==="]
 
             for c_idx, (short_name, col_header) in relevant_cols.items():
@@ -1402,30 +1428,35 @@ def extract_excel_text_for_ai(excel_paths: list, max_chars: int = 40000) -> str:
                 if pts:
                     start_ts, start_v = pts[0]
                     end_ts, end_v = pts[-1]
-                    min_ts, min_v = min(pts, key=lambda x: x[1])
-                    max_ts, max_v = max(pts, key=lambda x: x[1])
+                    min_idx = min(range(len(pts)), key=lambda i: pts[i][1])
+                    max_idx = max(range(len(pts)), key=lambda i: pts[i][1])
+                    min_ts, min_v = pts[min_idx]
+                    max_ts, max_v = pts[max_idx]
                     all_zero = all(abs(x[1]) < 1e-6 for x in pts)
+
+                    # Order the key turning points chronologically (Start -> Extremes -> End)
+                    key_indices = sorted({0, min_idx, max_idx, len(pts) - 1})
+                    turning_str = " -> ".join(f"{pts[i][1]} (at {pts[i][0]})" for i in key_indices)
+
                     stats_lines.append(
-                        f"- {short_name} (Excel column '{col_header}'): "
-                        f"First={start_v} (at {start_ts}) | Last={end_v} (at {end_ts}) | "
-                        f"Min={min_v} (at {min_ts}) | Max={max_v} (at {max_ts}) | "
-                        f"TotalValidReadings={len(pts)} | AllZero={all_zero}"
+                        f"- {short_name} (Excel column '{col_header}'):\n"
+                        f"  • First={start_v} (at {start_ts}) | Last={end_v} (at {end_ts}) | "
+                        f"Min={min_v} (at {min_ts}) | Max={max_v} (at {max_ts}) | AllZero={all_zero}\n"
+                        f"  • Chronological Turning Points: {turning_str}"
                     )
-                    # Sample 45 evenly spaced non-empty readings for this specific parameter
-                    # (plus always include the exact Min and Max points so spikes/drops are never missed)
-                    sample_n = 45
+
+                    sample_n = 50
                     if len(pts) > sample_n:
                         step = (len(pts) - 1) / float(sample_n - 1)
                         idxs = {round(i * step) for i in range(sample_n)}
-                        # Also force-include the index of the global min and max
-                        min_idx = min(range(len(pts)), key=lambda i: pts[i][1])
-                        max_idx = max(range(len(pts)), key=lambda i: pts[i][1])
                         idxs.update({0, len(pts) - 1, min_idx, max_idx})
                         sampled = [pts[i] for i in sorted(idxs)]
                     else:
                         sampled = pts
                     series_str = ", ".join(f"[{ts}: {v}]" for ts, v in sampled)
-                    per_param_series.append(f"\n• {short_name} ({col_header}) progression ({len(sampled)}/{len(pts)} pts):\n  {series_str}")
+                    per_param_series.append(
+                        f"\n• {short_name} ({col_header}) progression ({len(sampled)}/{len(pts)} pts):\n  {series_str}"
+                    )
                 else:
                     stats_lines.append(f"- {short_name} (Excel column '{col_header}'): No numeric data rows found")
 
@@ -2090,10 +2121,10 @@ Return ONLY one JSON object (no markdown, no code fence) with exactly this struc
 
 {{
   "parameters": {{
-    "PIP":       {{"status": "ok", "text": "Decreased from 2164 Psi to 1105 Psi", "note": ""}},
+    "PIP":       {{"status": "ok", "text": "Started at 423 Psi, spiked up to 583 Psi, then decreased to 399 Psi", "note": ""}},
     "PD":        {{"status": "ok", "text": "...", "note": ""}},
     "Motor Amp": {{"status": "ok", "text": "...", "note": ""}},
-    "Tm":        {{"status": "ok", "text": "Increased from 271.5 to 296.2 F", "note": ""}}
+    "Tm":        {{"status": "ok", "text": "Started at 272.5 F, dropped to 265.6 F, peaked at 277.9 F, then settled at 271.6 F", "note": ""}}
   }},
   "extras": [
     {{"name": "Vibration (Vx)", "text": "Varied between 0.2 & 0.5 G"}}
@@ -2113,9 +2144,9 @@ STRICT EXCLUSIONS (DO NOT analyze or include these under any circumstances):
 - NEVER include "Temp-Pump Intake" or "Temp-Pump Intake[degF]".
 
 NUMBER ROUNDING & PRECISION RULES (MANDATORY):
-- "PIP" and "PD": NO fractions/decimals at all (round to whole integers, e.g. 2864 Psi, 1105 Psi).
-- "Frequency (Hz)": NO fractions/decimals at all (round to whole integers, e.g. 45 Hz, 50 Hz — never 45.01 Hz).
-- "Motor Amp", "Tm", and "Vibration (Vx)": AT MOST ONE decimal place (1 fraction digit, e.g. 40.2 A, 324.5 F, 0.1 G — round 0.12 G to 0.1 G).
+- "PIP" and "PD": NO fractions/decimals at all (round to whole integers, e.g. 423 Psi, 583 Psi, 399 Psi).
+- "Frequency (Hz)": NO fractions/decimals at all (round to whole integers, e.g. 55 Hz — never 55.01 Hz).
+- "Motor Amp", "Tm", and "Vibration (Vx)": AT MOST ONE decimal place (1 fraction digit, e.g. 26.7 A, 272.5 F, 0.3 G — round 0.265 G to 0.3 G).
 
 STATUS RULES:
 - "ok": the parameter has valid readings in the Excel data (and is not hidden). Fill "text" using the exact Excel values.
@@ -2125,13 +2156,16 @@ STATUS RULES:
   Put a short description in "text", for example "Constant at 0 Psi".
 - Never guess or invent numbers. Always use the First, Last, Min, Max, and time-series progression from the Excel file.
 
-STYLE OF "text" (no parameter name, no asterisks, no trailing period, units always included: Psi, A, F, G, Hz):
-- Trend: "Decreased from X Psi to Y Psi" / "Increased from X to Y F" / "Constant at X Psi"
-- Range: "Varied between X & Y G" / "Fluctuated between X & Y A"
-- Spike/Drop: add "& spiked up to Z" or "& dropped to Z" when the Excel time-series shows a notable spike or drop
-- Motor Amp must ALWAYS include Frequency from "Status-Hz[Hz]", for example:
-  "Started at 52.7 A, then changed between 64.1 & 65.1 A while Frequency started at 43 Hz and increased to 50 Hz"
-  or, if frequency did not change: "... while Frequency was constant at 45 Hz".
+HOW TO WRITE "text" — COMPLETE YET BRIEF CHRONOLOGICAL PROGRESSION (MANDATORY):
+- Mention ALL notable changes in chronological order (Start -> intermediate spikes/drops/fluctuations -> End) in one concise sentence without timestamps.
+- Do NOT just write "Decreased from Start to End" if the parameter spiked, dropped, or fluctuated in between!
+- Examples of good, complete yet brief descriptions:
+  • If it spiked then decreased: "Started at 423 Psi, increased up to 583 Psi, then decreased to 399 Psi"
+  • If it fluctuated and had a brief drop/spike: "Started at 26.7 A, dropped to 20.5 A & spiked to 34.2 A, then stabilized around 26.6 A while Frequency was constant at 55 Hz"
+  • If it stayed within a narrow range with a brief peak: "Started at 272.5 F, varied between 265.6 & 277.9 F, and ended at 271.6 F"
+  • If it only varied within a range: "Varied between 0.2 & 0.5 G (started at 0.3 G & ended at 0.3 G)"
+- No parameter name at the start, no asterisks, no trailing period, units always included (Psi, A, F, G, Hz).
+- Motor Amp must ALWAYS include Frequency from "Status-Hz[Hz]" (including any Hz changes, or "... while Frequency was constant at X Hz").
 - If the Excel data shows the well shut down (Amps and Hz dropping to 0) or restarted during the period, mention it briefly inside the relevant texts.
 
 "extras": include "Vibration (Vx)" (from "Vib-Pump X axis[G]") here using the same style. Do not put the four main parameters or excluded parameters here.
