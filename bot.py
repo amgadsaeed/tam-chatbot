@@ -1342,8 +1342,8 @@ def _to_float(val):
 
 
 def extract_excel_text_for_ai(excel_paths: list, max_chars: int = 40000) -> str:
-    """Read exported Excel/CSV files, compute exact Start/End/Min/Max stats for the 6 target columns,
-    and provide a full-period time-series table for Gemini."""
+    """Read exported Excel/CSV files (with read_only=False so ProductionLink's dimension tag doesn't
+    truncate rows), compute exact Start/End/Min/Max stats, and build per-parameter time series."""
     if not excel_paths:
         return ""
 
@@ -1358,7 +1358,9 @@ def extract_excel_text_for_ai(excel_paths: list, max_chars: int = 40000) -> str:
                         if any(c is not None and str(c).strip() != "" for c in r):
                             all_rows.append(["" if c is None else str(c).strip() for c in r])
             else:
-                wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+                # CRITICAL: read_only=False is required because ProductionLink .xlsx files
+                # have a broken dimension header that causes read_only=True to read only cell A1!
+                wb = openpyxl.load_workbook(path, data_only=True, read_only=False)
                 for sheet_name in wb.sheetnames:
                     ws = wb[sheet_name]
                     for row in ws.iter_rows(values_only=True):
@@ -1369,7 +1371,7 @@ def extract_excel_text_for_ai(excel_paths: list, max_chars: int = 40000) -> str:
             if not all_rows:
                 continue
 
-            # Locate the header row (the row containing parameter names like Press-Pump Intake or Status-Hz)
+            # Locate the header row
             header_idx = 0
             for idx, r in enumerate(all_rows[:20]):
                 joined = " ".join(r).lower()
@@ -1380,15 +1382,15 @@ def extract_excel_text_for_ai(excel_paths: list, max_chars: int = 40000) -> str:
             headers = all_rows[header_idx]
             data_rows = all_rows[header_idx + 1 :]
 
-            # Identify timestamp column (usually column 0) and relevant parameter columns
             relevant_cols = {}  # col_idx -> (short_name, exact_header)
             for c_idx, h in enumerate(headers):
                 short_name, canonical = _match_target_col(h)
                 if short_name:
                     relevant_cols[c_idx] = (short_name, h or canonical)
 
-            # Compute exact summary statistics per parameter so older models never misread start/end/min/max
             stats_lines = ["=== EXACT CALCULATED SUMMARY STATISTICS FROM EXCEL ==="]
+            per_param_series = ["=== SAMPLED TIME-SERIES PER PARAMETER (NON-EMPTY READINGS) ==="]
+
             for c_idx, (short_name, col_header) in relevant_cols.items():
                 pts = []
                 for r in data_rows:
@@ -1407,40 +1409,31 @@ def extract_excel_text_for_ai(excel_paths: list, max_chars: int = 40000) -> str:
                         f"- {short_name} (Excel column '{col_header}'): "
                         f"First={start_v} (at {start_ts}) | Last={end_v} (at {end_ts}) | "
                         f"Min={min_v} (at {min_ts}) | Max={max_v} (at {max_ts}) | "
-                        f"Points={len(pts)} | AllZero={all_zero}"
+                        f"TotalValidReadings={len(pts)} | AllZero={all_zero}"
                     )
+                    # Sample 45 evenly spaced non-empty readings for this specific parameter
+                    # (plus always include the exact Min and Max points so spikes/drops are never missed)
+                    sample_n = 45
+                    if len(pts) > sample_n:
+                        step = (len(pts) - 1) / float(sample_n - 1)
+                        idxs = {round(i * step) for i in range(sample_n)}
+                        # Also force-include the index of the global min and max
+                        min_idx = min(range(len(pts)), key=lambda i: pts[i][1])
+                        max_idx = max(range(len(pts)), key=lambda i: pts[i][1])
+                        idxs.update({0, len(pts) - 1, min_idx, max_idx})
+                        sampled = [pts[i] for i in sorted(idxs)]
+                    else:
+                        sampled = pts
+                    series_str = ", ".join(f"[{ts}: {v}]" for ts, v in sampled)
+                    per_param_series.append(f"\n• {short_name} ({col_header}) progression ({len(sampled)}/{len(pts)} pts):\n  {series_str}")
                 else:
                     stats_lines.append(f"- {short_name} (Excel column '{col_header}'): No numeric data rows found")
 
-            # Filter table columns to Timestamp (col 0) + the 6 relevant columns (if matched; otherwise keep all)
-            if relevant_cols:
-                keep_indices = [0] + sorted(i for i in relevant_cols.keys() if i != 0)
-            else:
-                keep_indices = list(range(len(headers)))
-
-            def _fmt_row(r):
-                return "\t".join(r[i] if i < len(r) else "" for i in keep_indices)
-
-            table_header = _fmt_row(headers)
-
-            # Evenly sample up to 240 rows across the ENTIRE dataset so mid-period spikes/shutdowns are always visible
-            max_sample = 240
-            if len(data_rows) > max_sample:
-                step = (len(data_rows) - 1) / float(max_sample - 1)
-                sampled_indices = sorted({round(i * step) for i in range(max_sample)})
-                sampled_rows = [_fmt_row(data_rows[i]) for i in sampled_indices]
-                table_title = f"=== EXCEL TIME-SERIES DATA ({len(sampled_rows)} evenly-spaced rows out of {len(data_rows)} total) ==="
-            else:
-                sampled_rows = [_fmt_row(r) for r in data_rows]
-                table_title = f"=== EXCEL TIME-SERIES DATA (All {len(data_rows)} rows) ==="
-
             chunks.append(
-                f"=== File: {fname} ===\n"
+                f"=== File: {fname} (Total rows in sheet: {len(data_rows)}) ===\n"
                 + "\n".join(stats_lines)
-                + f"\n\n{table_title}\n"
-                + table_header
-                + "\n"
-                + "\n".join(sampled_rows)
+                + "\n\n"
+                + "\n".join(per_param_series)
             )
         except Exception as e:
             chunks.append(f"=== File: {fname} (could not parse: {e}) ===")
@@ -1714,6 +1707,12 @@ def crop_right(path, px):
         img.crop((0, 0, w - px, h)).save(path)
 
 
+def get_clean_chart_path(out_path: str) -> str:
+    """Return the file path for the clean screenshot (without pinpoints)."""
+    base, ext = os.path.splitext(out_path)
+    return f"{base}_clean{ext or '.png'}"
+
+
 async def render_and_screenshot_chart(
     page,
     notify,
@@ -1727,8 +1726,8 @@ async def render_and_screenshot_chart(
     apply_dates=True,
     export_dir=None,
 ):
-    """Apply `period`, toggle PIP/PD, place 2 freeze points, screenshot the chart,
-    and optionally export/unzip the Excel data sheet for the current view."""
+    """Apply `period`, toggle PIP/PD, capture a clean screenshot (no points), place 2 freeze points,
+    capture the pinpointed screenshot, and optionally export/unzip the Excel data sheet."""
     if reload_tab:
         await notify(f"🔃 Reloading Trends tab (with +{extra_wait}s extra wait)...")
         _, tab = await find_in_frames(page, TRENDS_TAB, timeout=15)
@@ -1760,7 +1759,7 @@ async def render_and_screenshot_chart(
     period_label = compute_period_label(period, rng_text)
     await notify(f"🏷 Chart header well: {chart_well_name} | Period: {period_label}")
 
-    # Toggle PIP and PD visibility
+    # Toggle PIP and PD visibility (also closes any existing freeze points)
     await set_tag_visibility_on_chart(page, PIP_TAG_SEL, "PIP (Press-Pump Intake)", remove_pip, notify)
     await set_tag_visibility_on_chart(page, PD_TAG_SEL, "PD (Press-Pump Discharge)", remove_pd, notify)
 
@@ -1768,10 +1767,27 @@ async def render_and_screenshot_chart(
         await notify("⏳ Waiting 4s for chart layout and axes to settle after curve removal...")
         await asyncio.sleep(4.0)
 
-    # Re-fetch chart_area after stabilization so place_points targets the fresh DOM element
+    # Re-fetch chart_area after stabilization
     _, fresh_chart_area = await find_in_frames(page, CHART_SEL, timeout=20, need_size=True)
     chart_area = fresh_chart_area or chart_area
 
+    # Make sure no leftover points or hover tooltips are visible, then capture the CLEAN screenshot
+    for fr in page.frames:
+        try:
+            await fr.evaluate("""() => {
+                document.querySelectorAll('#freezeDataContainer img[id$="_close"]').forEach(b => b.click());
+            }""")
+        except Exception:
+            pass
+    await page.mouse.move(5, 5)
+    await asyncio.sleep(0.4)
+
+    clean_path = get_clean_chart_path(out_path)
+    await chart_area.screenshot(path=clean_path)
+    crop_right(clean_path, CROP_RIGHT_PX)
+    await notify("📸 Clean chart screenshot (without pinpoints) captured")
+
+    # Now place the 2 freeze points and capture the PINPOINTED screenshot
     if PLACE_POINTS:
         try:
             await place_points(page, chart_area, notify)
@@ -1780,7 +1796,7 @@ async def render_and_screenshot_chart(
 
     await chart_area.screenshot(path=out_path)
     crop_right(out_path, CROP_RIGHT_PX)
-    await notify("📸 Chart screenshot captured")
+    await notify("📸 Pinpointed chart screenshot captured")
 
     # Export and download the Excel data sheet for the current view (if export_dir is given)
     excel_files = []
@@ -1792,7 +1808,6 @@ async def render_and_screenshot_chart(
             await notify(f"⚠️ Could not export Excel sheet: {str(e)[:200]} (continuing with screenshot)")
 
     return chart_well_name, period_label, excel_files
-
 
 async def capture_chart_advanced(
     well_name,
@@ -2349,12 +2364,26 @@ def build_report(well, period_label, data, decisions):
 
 
 async def send_chart_and_excels(bot, chat_id, update_msg, image_path, excel_files, caption):
-    """Send the chart screenshot and any exported Excel files to the Telegram chat."""
-    with open(image_path, "rb") as photo:
-        if update_msg:
-            await update_msg.reply_photo(photo=photo, caption=caption)
-        else:
-            await bot.send_photo(chat_id, photo=photo, caption=caption)
+    """Send the clean chart screenshot (no pinpoints), the pinpointed chart screenshot,
+    and any exported Excel files to the Telegram chat."""
+    clean_path = get_clean_chart_path(image_path)
+    if os.path.exists(clean_path):
+        with open(clean_path, "rb") as clean_photo:
+            if update_msg:
+                await update_msg.reply_photo(
+                    photo=clean_photo, caption=f"{caption} — Clean (No Pinpoints)"
+                )
+            else:
+                await bot.send_photo(
+                    chat_id, photo=clean_photo, caption=f"{caption} — Clean (No Pinpoints)"
+                )
+
+    if os.path.exists(image_path):
+        with open(image_path, "rb") as photo:
+            if update_msg:
+                await update_msg.reply_photo(photo=photo, caption=f"{caption} — With Pinpoints")
+            else:
+                await bot.send_photo(chat_id, photo=photo, caption=f"{caption} — With Pinpoints")
 
     for xl_path in excel_files or []:
         if os.path.exists(xl_path):
@@ -3249,7 +3278,7 @@ async def handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_photo(photo=debug_img, caption="📸 Screenshot at the moment of the error")
 
     finally:
-        for f in (path, debug_path):
+        for f in (path, get_clean_chart_path(path), debug_path):
             if os.path.exists(f):
                 os.remove(f)
         if os.path.exists(export_dir):
