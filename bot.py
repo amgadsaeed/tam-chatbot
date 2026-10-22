@@ -112,7 +112,7 @@ HPUMP_GRID_PARAMS = [
     "Vib-HPump",
     "Temp-Motor PH A Hpump",
     "Temp-HTC",
-    "Pwr-Motor Amps Ph B",
+    "Pwr-Output Amps Ph B",
     "Pwr-Output Volts AB",
 ]
 
