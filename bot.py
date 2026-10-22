@@ -81,8 +81,8 @@ PARAM_FULL = {
     "Tm": "Temp-Motor",
 }
 
-# Grid View > Facility Parameters: the rows to read (exact names as shown in the grid)
-GRID_PARAMS = [
+# Grid View > Facility Parameters for standard ESP wells
+ESP_GRID_PARAMS = [
     "Status-Motor",
     "Status-Hz",
     "Shutdown-Current SD Reason",
@@ -95,6 +95,25 @@ GRID_PARAMS = [
     "Vib-Pump X axis",
     "Vib-Pump Y axis",
     "Pwr-Motor Amps Ph B",
+    "Power DHG - System Volts",
+    "Pwr DHG-System Current",
+]
+
+# Grid View > Facility Parameters for HPUMP wells (HPS / SHAHD / ZAHRAA)
+HPUMP_GRID_PARAMS = [
+    "Status-Motor",
+    "Status-Hz",
+    "Shutdown-Current SD Reason",
+    "Shutdown-Last Shutdown Reason",
+    "Press-Suction",
+    "Press-Pump Discharge",
+    "Temp-Motor Fwd Bearing Hpump",
+    "Temp-Motor Rear Bearing Hpump",
+    "Vib-HPump",
+    "Temp-Motor PH A Hpump",
+    "Temp-HTC",
+    "Pwr-Motor Amps Ph B",
+    "Pwr-Output Volts AB",
 ]
 
 # Well search retries (verifies via breadcrumb li.current a)
@@ -2041,9 +2060,17 @@ async def scan_grid(page, visit, max_steps=35):
     return None
 
 
-async def collect_grid_params(page, notify):
-    """Read Measurement / Value / Unit / Date Time / Alarm Class of the GRID_PARAMS rows."""
-    wanted = {norm_name(n): n for n in GRID_PARAMS}
+async def collect_grid_params(page, notify, well_name=""):
+    """Read Measurement / Value / Unit / Date Time / Alarm Class of the target rows
+    (uses HPUMP_GRID_PARAMS for HPUMP wells and ESP_GRID_PARAMS for ESP wells)."""
+    bc = (await get_current_well_name(page)) or ""
+    is_hpump = (
+        "HPUMP" in bc.upper()
+        or get_well_prefix(clean_well_name(well_name or bc)) == "HPUMP_"
+    )
+    target_params = HPUMP_GRID_PARAMS if is_hpump else ESP_GRID_PARAMS
+
+    wanted = {norm_name(n): n for n in target_params}
     found = {}
 
     async def visit(fr, rows_data):
@@ -2053,11 +2080,13 @@ async def collect_grid_params(page, notify):
                 found[key] = r
         return len(found) == len(wanted)
 
-    await notify("🧾 Reading the Facility Parameters grid...")
+    await notify(
+        f"🧾 Reading the Facility Parameters grid ({'HPUMP' if is_hpump else 'ESP'} parameters)..."
+    )
     await scan_grid(page, visit)
 
     results = []
-    for name in GRID_PARAMS:
+    for name in target_params:
         r = found.get(norm_name(name)) or {}
         results.append(
             {
@@ -2088,8 +2117,8 @@ async def capture_grid_view(well_name, page, notify, login_ui):
     await open_well(well_name, page, notify, login_ui)
     await ensure_tab_open(page, GRID_TAB, "Grid View", notify)
     await ensure_tab_open(page, FACILITY_TAB, "Facility Parameters", notify)
-    await asyncio.sleep(0.8)  # scan_grid polls immediately for the rows
-    return await collect_grid_params(page, notify)
+    await asyncio.sleep(0.8)
+    return await collect_grid_params(page, notify, well_name=well_name)
 
 
 def format_grid_message(well, results):
@@ -3161,7 +3190,7 @@ async def run_grid_flow(bot, chat_id, well, notify, debug_path):
                     await asyncio.sleep(1.0)  # WAS: 3s
                     await wait_loading_dialog_gone(page, notify, appear_timeout=1.2, disappear_timeout=45)  # WAS: appear_timeout=3
 
-            results = await collect_grid_params(page, notify)
+            results = await collect_grid_params(page, notify, well_name=well)
             await bot.send_message(chat_id, format_grid_message(well, results), parse_mode="HTML")
 
 
