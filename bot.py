@@ -2683,73 +2683,127 @@ async def wait_loading_dialog_gone(page, notify, appear_timeout=6, disappear_tim
 
 
 async def reset_and_mark_single_param(page, target_name, notify):
-    """Fast single-parameter marker: unchecks any checked rows and jumps directly to `target_name`
-    using its saved `rowindex` (falls back to a fast grid scan if needed)."""
-    await notify(f"☑️ Selecting '{target_name}'...")
-    fr = await grid_frame(page)
-    if not fr:
-        raise Exception("Facility Parameters grid frame not found.")
-
+    """Wait 3s, scroll the target parameter into view, uncheck any other rows, and tick `target_name`.
+    If marking fails or raises an error, reload Facility Parameters and retry automatically."""
     want_key = norm_name(target_name)
-    target_row_idx = LAST_GRID_ROW_INDEX.get(want_key)
 
-    # 1. Fast path: if we know the rowindex and no other row is checked (or we uncheck visible ones),
-    #    jump straight to that rowindex!
-    content = await fr.query_selector("#contentfacilitytblcontainer")
-    box = await content.bounding_box() if content else None
+    async def _scroll_row_into_center(fr, row_el, row_idx=None):
+        """Ensure the selected parameter row is centered and clearly visible inside the grid before screenshot."""
+        content = await fr.query_selector("#contentfacilitytblcontainer")
+        box = await content.bounding_box() if content else None
+        if row_idx is not None:
+            # Scroll so the target row sits ~3-4 rows below the top header (clearly visible in the screenshot)
+            target_y = max(0, (row_idx - 3) * 28)
+            await _scroll_grid_to(page, fr, box, target_y)
+            await asyncio.sleep(0.6)
+        if row_el:
+            try:
+                await row_el.scroll_into_view_if_needed()
+                await asyncio.sleep(0.4)
+            except Exception:
+                pass
 
-    async def _try_mark_in_current_view():
-        """Uncheck any other checked boxes currently rendered and tick `want_key` if visible."""
-        found_status = None
-        for row in await fr.query_selector_all(GRID_ROW_SEL):
-            lab = await row.query_selector('div[columnindex="3"] label')
-            if not lab:
-                continue
-            key = norm_name((await lab.get_attribute("actualtagname")) or (await lab.inner_text()))
-            cb = await row.query_selector('div[columnindex="1"] .jqx-checkbox')
-            if not cb:
+    async def _attempt_select(reload_first=False):
+        if reload_first:
+            await notify("🔄 Reloading 'Facility Parameters' to reset the grid and retry...")
+            _, fac_tab = await find_in_frames(page, FACILITY_TAB, timeout=20)
+            if fac_tab:
+                await click(fac_tab)
+                await asyncio.sleep(3.5)
+                await wait_loading_dialog_gone(page, notify, appear_timeout=2.0, disappear_timeout=45)
+
+        # Wait 3 seconds before selecting the parameter so the grid is completely settled
+        await notify(f"⏳ Waiting 3s before selecting '{target_name}'...")
+        await asyncio.sleep(3.0)
+
+        fr = await grid_frame(page)
+        if not fr:
+            raise Exception("Facility Parameters grid frame not found.")
+
+        content = await fr.query_selector("#contentfacilitytblcontainer")
+        box = await content.bounding_box() if content else None
+        target_row_idx = LAST_GRID_ROW_INDEX.get(want_key)
+
+        async def _try_mark_in_current_view():
+            """Uncheck any other visible checked rows, and if `want_key` is visible, center it and tick it."""
+            found_status = None
+            for row in await fr.query_selector_all(GRID_ROW_SEL):
+                lab = await row.query_selector('div[columnindex="3"] label')
+                if not lab:
+                    continue
+                key = norm_name((await lab.get_attribute("actualtagname")) or (await lab.inner_text()))
+                r_idx_attr = await lab.get_attribute("rowindex")
+                r_idx = int(r_idx_attr) if (r_idx_attr and r_idx_attr.isdigit()) else target_row_idx
+                if r_idx is not None:
+                    LAST_GRID_ROW_INDEX[key] = r_idx
+
+                cb = await row.query_selector('div[columnindex="1"] .jqx-checkbox')
+                if not cb:
+                    if key == want_key:
+                        found_status = "no checkbox"
+                    continue
+
+                is_checked = await _cb_checked(cb)
                 if key == want_key:
-                    found_status = "no checkbox"
-                continue
+                    # Center the row in the viewport first so both the click and screenshot see it clearly
+                    await _scroll_row_into_center(fr, row, r_idx)
+                    # Re-query the checkbox after scrolling in case jqxGrid re-rendered the row DOM
+                    for r2 in await fr.query_selector_all(GRID_ROW_SEL):
+                        lab2 = await r2.query_selector('div[columnindex="3"] label')
+                        if not lab2:
+                            continue
+                        k2 = norm_name((await lab2.get_attribute("actualtagname")) or (await lab2.inner_text()))
+                        if k2 == want_key:
+                            cb = await r2.query_selector('div[columnindex="1"] .jqx-checkbox') or cb
+                            break
 
-            is_checked = await _cb_checked(cb)
-            if key == want_key:
-                if not is_checked:
+                    if not await _cb_checked(cb):
+                        await click(cb)
+                        await asyncio.sleep(0.8)
+                    found_status = "marked" if await _cb_checked(cb) else "clicked"
+                elif is_checked:
                     await click(cb)
-                    await asyncio.sleep(0.35)
-                found_status = "marked" if await _cb_checked(cb) else "clicked"
-            elif is_checked:
-                await click(cb)
-                await asyncio.sleep(0.2)
-        return found_status
+                    await asyncio.sleep(0.4)
+            return found_status
 
-    # First uncheck any currently visible checked boxes where we are
-    await _try_mark_in_current_view()
+        # 1. If we know the parameter's rowindex, scroll directly to it first so it is on screen
+        if target_row_idx is not None:
+            target_y = max(0, (target_row_idx - 3) * 28)
+            await _scroll_grid_to(page, fr, box, target_y)
+            await asyncio.sleep(0.8)
+            status = await _try_mark_in_current_view()
+            if status == "marked":
+                await asyncio.sleep(0.5)  # brief pause so the checkmark is rendered for the screenshot
+                return status
 
-    # If we know the parameter's rowindex, scroll directly to it (~28px per row)
-    if target_row_idx is not None:
-        target_y = max(0, (target_row_idx - 3) * 28)
-        await _scroll_grid_to(page, fr, box, target_y)
-        await asyncio.sleep(0.3)
-        status = await _try_mark_in_current_view()
-        if status in ("marked", "clicked", "no checkbox"):
+        # 2. Scan through the grid from the top until the parameter is found, centered, and marked
+        result_status = "not found"
+
+        async def visit(frame, _rows_data):
+            nonlocal result_status
+            st = await _try_mark_in_current_view()
+            if st:
+                result_status = st
+            return result_status in ("marked", "no checkbox")
+
+        await scan_grid(page, visit)
+        await asyncio.sleep(0.5)
+        return result_status
+
+    # First attempt: select directly (with 3s wait and scroll-into-view)
+    try:
+        status = await _attempt_select(reload_first=False)
+        if status == "marked":
             await notify(f"☑️ {target_name}: {status}")
             return status
+        await notify(f"⚠️ Initial selection returned '{status}'. Reloading Facility Parameters and retrying...")
+    except Exception as e:
+        await notify(f"⚠️ Error selecting '{target_name}' ({str(e)[:120]}). Reloading Facility Parameters and retrying...")
 
-    # 2. Fallback: fast scan from top if the direct jump didn't see the row
-    result_status = "not found"
-
-    async def visit(frame, _rows_data):
-        nonlocal result_status
-        st = await _try_mark_in_current_view()
-        if st:
-            result_status = st
-        return result_status in ("marked", "clicked", "no checkbox")
-
-    await scan_grid(page, visit)
-    await notify(f"☑️ {target_name}: {result_status}")
-    return result_status
-
+    # Second attempt (Fallback): reload Facility Parameters tab to clear/reset everything and reselect
+    status = await _attempt_select(reload_first=True)
+    await notify(f"☑️ {target_name}: {status}")
+    return status
 
 async def run_demand_scan(bot, chat_id, well, page, notify, debug_path):
     """Click Demand Scan -> click Ok if confirmation appears, or skip if loading bar appears directly ->
