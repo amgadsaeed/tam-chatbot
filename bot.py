@@ -433,9 +433,22 @@ async def pick_view(bot, chat_id, well):
     return value
 
 
-async def pick_single_param_to_mark(bot, chat_id, available):
-    """Single-select of a grid parameter (only 1 parameter can be checked). Returns name or None."""
-    rows = [[(f"⬜ {n}", ("pick", i))] for i, n in enumerate(available)]
+def format_alarm_badge(alarm_str: str) -> str:
+    """Format an alarm class like 'LOW-LOW' or 'High' into a clear badge."""
+    if not alarm_str:
+        return ""
+    up = alarm_str.upper()
+    icon = "🚨" if ("HIGH-HIGH" in up or "LOW-LOW" in up) else "⚠️"
+    return f" [{icon} {alarm_str}]"
+
+
+async def pick_single_param_to_mark(bot, chat_id, available_items):
+    """Single-select of a grid parameter. `available_items` is a list of result dicts.
+    Shows any active alarm class (e.g. LOW-LOW, HIGH-HIGH, High, Low) next to the parameter name."""
+    rows = []
+    for i, item in enumerate(available_items):
+        badge = format_alarm_badge(item.get("alarm", ""))
+        rows.append([(f"⬜ {item['param']}{badge}", ("pick", i))])
     rows.append([("🛑 End Session", END_SESSION)])
 
     (kind, idx), msg = await ask_grid(
@@ -452,12 +465,13 @@ async def pick_single_param_to_mark(bot, chat_id, available):
             pass
         return None
 
-    chosen = available[idx]
+    chosen_item = available_items[idx]
+    badge = format_alarm_badge(chosen_item.get("alarm", ""))
     try:
-        await msg.edit_text(f"☑️ Selected parameter: {chosen}")
+        await msg.edit_text(f"☑️ Selected parameter: {chosen_item['param']}{badge}")
     except Exception:
         pass
-    return chosen
+    return chosen_item["param"]
 
 
 # =====================================================================================
@@ -1897,27 +1911,51 @@ async def capture_chart_advanced(
 
 
 # =====================================================================================
-# Grid View > Facility Parameters
+# Grid View > Facility Parameters (Fast jqxGrid Scanner + Alarm Class Detection)
 # =====================================================================================
 GRID_ROW_SEL = 'div[role="row"][id^="row"][id$="facilitytblcontainer"]'
 GRID_JS = """() => {
   const out = [];
+  const alarmRe = /^(high-high|low-low|high|low|hh|ll|hi|lo|alarm|critical|warning)$/i;
   document.querySelectorAll('div[role="row"][id^="row"][id$="facilitytblcontainer"]').forEach(row => {
-    const lab = row.querySelector('div[columnindex="3"] label');
+    const cell3 = row.querySelector('div[columnindex="3"]');
+    if (!cell3) return;
+    const lab = cell3.querySelector('label');
     if (!lab) return;
+
+    // Detect alarm span class inside columnindex="3" (e.g. <span class="LOW-LOW"></span>)
+    let alarm = '';
+    cell3.querySelectorAll('span[class]').forEach(sp => {
+      const cls = (sp.className || '').trim();
+      if (!cls) return;
+      for (const token of cls.split(/\\s+/)) {
+        if (alarmRe.test(token) || /high|low/i.test(token)) {
+          alarm = token;
+          break;
+        }
+      }
+    });
+
     const cell = i => {
       const c = row.querySelector('div[columnindex="' + i + '"]');
       return c ? (c.innerText || '').replace(/\\s+/g, ' ').trim() : '';
     };
+
+    const rowIdxAttr = lab.getAttribute('rowindex');
     out.push({
       name: (lab.getAttribute('actualtagname') || lab.innerText || '').trim(),
       value: cell(4),
       unit: cell(5),
       time: cell(6),
+      alarm: alarm,
+      rowindex: rowIdxAttr !== null ? parseInt(rowIdxAttr, 10) : null,
     });
   });
   return out;
 }"""
+
+# Remembers {normalized_param_name: rowindex} from the latest scan so marking is instant
+LAST_GRID_ROW_INDEX = {}
 
 
 def norm_name(s):
@@ -1935,51 +1973,81 @@ async def grid_frame(page):
     return None
 
 
-async def scan_grid(page, visit, max_steps=80):
-    """Scroll through the Facility Parameters grid from the top, calling `await visit(frame)`."""
+async def _scroll_grid_to(page, fr, box, y_px: int):
+    """Scroll the jqxGrid to vertical offset `y_px` using its native JS API or fast mouse wheel."""
+    used_js = await fr.evaluate(
+        """(y) => {
+            try {
+                if (window.$ && $('#facilitytblcontainer').length) {
+                    $('#facilitytblcontainer').jqxGrid('scrolloffset', y, 0);
+                    return true;
+                }
+            } catch (e) {}
+            return false;
+        }""",
+        y_px,
+    )
+    if not used_js and box:
+        await page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+        await page.mouse.wheel(0, 650 if y_px > 0 else -5000)
+
+
+async def scan_grid(page, visit, max_steps=35):
+    """Fast virtual-grid scanner: uses jqxGrid scrolloffset (or 650px wheel jumps) with 0.22s pauses."""
     fr = None
-    for _ in range(40):
+    for _ in range(80):  # poll every 0.4s (up to 32s)
         try:
             fr = await grid_frame(page)
             if fr and await fr.evaluate(GRID_JS):
                 break
         except Exception:
             pass
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.4)
     else:
         raise Exception("The Facility Parameters grid did not load.\n" + frames_report(page))
 
     content = await fr.query_selector("#contentfacilitytblcontainer")
     box = await content.bounding_box() if content else None
+
+    # Jump straight to top (y = 0)
+    await _scroll_grid_to(page, fr, box, 0)
     if box:
         await page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-        for _ in range(8):
-            await page.mouse.wheel(0, -3000)
-            await asyncio.sleep(0.2)
-        await asyncio.sleep(0.8)
+        for _ in range(3):
+            await page.mouse.wheel(0, -4000)
+            await asyncio.sleep(0.05)
+    await asyncio.sleep(0.25)
 
     seen, stale = set(), 0
-    for _ in range(max_steps):
-        result = await visit(fr)
+    for step in range(max_steps):
+        rows_data = await fr.evaluate(GRID_JS)
+        for r in rows_data:
+            if r.get("rowindex") is not None:
+                LAST_GRID_ROW_INDEX[norm_name(r["name"])] = r["rowindex"]
+
+        result = await visit(fr, rows_data)
         if result:
             return result
-        names = {norm_name(r["name"]) for r in await fr.evaluate(GRID_JS)}
+
+        names = {norm_name(r["name"]) for r in rows_data}
         stale = stale + 1 if names <= seen else 0
         seen |= names
-        if not box or stale >= 3:
+        if stale >= 2:
             break
-        await page.mouse.wheel(0, 300)
-        await asyncio.sleep(0.8)
+
+        # Advance 18 rows (~500-650px) per step
+        await _scroll_grid_to(page, fr, box, (step + 1) * 500)
+        await asyncio.sleep(0.22)
     return None
 
 
 async def collect_grid_params(page, notify):
-    """Read Measurement / Value / Unit / Date Time of the GRID_PARAMS rows."""
+    """Read Measurement / Value / Unit / Date Time / Alarm Class of the GRID_PARAMS rows."""
     wanted = {norm_name(n): n for n in GRID_PARAMS}
     found = {}
 
-    async def visit(fr):
-        for r in await fr.evaluate(GRID_JS):
+    async def visit(fr, rows_data):
+        for r in rows_data:
             key = norm_name(r["name"])
             if key in wanted and key not in found:
                 found[key] = r
@@ -1992,7 +2060,15 @@ async def collect_grid_params(page, notify):
     for name in GRID_PARAMS:
         r = found.get(norm_name(name)) or {}
         results.append(
-            {"param": name, "found": bool(r), "value": r.get("value", ""), "unit": r.get("unit", ""), "time": r.get("time", "")}
+            {
+                "param": name,
+                "found": bool(r),
+                "value": r.get("value", ""),
+                "unit": r.get("unit", ""),
+                "time": r.get("time", ""),
+                "alarm": r.get("alarm", ""),
+                "rowindex": r.get("rowindex"),
+            }
         )
     await notify(f"🧾 Found {len(found)}/{len(results)} parameters")
     return results
@@ -2012,7 +2088,7 @@ async def capture_grid_view(well_name, page, notify, login_ui):
     await open_well(well_name, page, notify, login_ui)
     await ensure_tab_open(page, GRID_TAB, "Grid View", notify)
     await ensure_tab_open(page, FACILITY_TAB, "Facility Parameters", notify)
-    await asyncio.sleep(3)
+    await asyncio.sleep(0.8)  # scan_grid polls immediately for the rows
     return await collect_grid_params(page, notify)
 
 
@@ -2020,13 +2096,13 @@ def format_grid_message(well, results):
     lines = [f"<b>🧾 Facility Parameters — {html_lib.escape(well)}</b>", "Measurement → Value (Unit) | Date Time", ""]
     for i, r in enumerate(results, 1):
         name = html_lib.escape(r["param"])
+        badge = html_lib.escape(format_alarm_badge(r.get("alarm", "")))
         if r["found"]:
             val = f"{r['value']} {r['unit'] if r['unit'] not in ('', '-') else ''}".strip()
-            lines.append(f"{i}. <b>{name}</b>\n    {html_lib.escape(val)}  |  {html_lib.escape(r['time'])}")
+            lines.append(f"{i}. <b>{name}{badge}</b>\n    {html_lib.escape(val)}  |  {html_lib.escape(r['time'])}")
         else:
             lines.append(f"{i}. <b>{name}</b>\n    ⚠️ not found in the grid")
     return "\n".join(lines)
-
 
 # =====================================================================================
 # Gemini analysis and report (with Excel data + multi-round model retry)
@@ -2607,20 +2683,24 @@ async def wait_loading_dialog_gone(page, notify, appear_timeout=6, disappear_tim
 
 
 async def reset_and_mark_single_param(page, target_name, notify):
-    """Click Facility Parameters tab to refresh/uncheck all, ensure no other row is checked,
-    and tick only `target_name`."""
-    await notify("🔄 Clicking 'Facility Parameters' to refresh and uncheck all parameters...")
-    _, fac_tab = await find_in_frames(page, FACILITY_TAB, timeout=20)
-    if fac_tab:
-        await click(fac_tab)
-        await asyncio.sleep(4)
-        await wait_loading_dialog_gone(page, notify, appear_timeout=3, disappear_timeout=45)
+    """Fast single-parameter marker: unchecks any checked rows and jumps directly to `target_name`
+    using its saved `rowindex` (falls back to a fast grid scan if needed)."""
+    await notify(f"☑️ Selecting '{target_name}'...")
+    fr = await grid_frame(page)
+    if not fr:
+        raise Exception("Facility Parameters grid frame not found.")
 
     want_key = norm_name(target_name)
-    result_status = "not found"
+    target_row_idx = LAST_GRID_ROW_INDEX.get(want_key)
 
-    async def visit(fr):
-        nonlocal result_status
+    # 1. Fast path: if we know the rowindex and no other row is checked (or we uncheck visible ones),
+    #    jump straight to that rowindex!
+    content = await fr.query_selector("#contentfacilitytblcontainer")
+    box = await content.bounding_box() if content else None
+
+    async def _try_mark_in_current_view():
+        """Uncheck any other checked boxes currently rendered and tick `want_key` if visible."""
+        found_status = None
         for row in await fr.query_selector_all(GRID_ROW_SEL):
             lab = await row.query_selector('div[columnindex="3"] label')
             if not lab:
@@ -2629,23 +2709,45 @@ async def reset_and_mark_single_param(page, target_name, notify):
             cb = await row.query_selector('div[columnindex="1"] .jqx-checkbox')
             if not cb:
                 if key == want_key:
-                    result_status = "no checkbox"
+                    found_status = "no checkbox"
                 continue
 
             is_checked = await _cb_checked(cb)
             if key == want_key:
                 if not is_checked:
                     await click(cb)
-                    await asyncio.sleep(0.8)
-                result_status = "marked" if await _cb_checked(cb) else "clicked"
-                await notify(f"☑️ {target_name}: {result_status}")
+                    await asyncio.sleep(0.35)
+                found_status = "marked" if await _cb_checked(cb) else "clicked"
             elif is_checked:
                 await click(cb)
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.2)
+        return found_status
 
+    # First uncheck any currently visible checked boxes where we are
+    await _try_mark_in_current_view()
+
+    # If we know the parameter's rowindex, scroll directly to it (~28px per row)
+    if target_row_idx is not None:
+        target_y = max(0, (target_row_idx - 3) * 28)
+        await _scroll_grid_to(page, fr, box, target_y)
+        await asyncio.sleep(0.3)
+        status = await _try_mark_in_current_view()
+        if status in ("marked", "clicked", "no checkbox"):
+            await notify(f"☑️ {target_name}: {status}")
+            return status
+
+    # 2. Fallback: fast scan from top if the direct jump didn't see the row
+    result_status = "not found"
+
+    async def visit(frame, _rows_data):
+        nonlocal result_status
+        st = await _try_mark_in_current_view()
+        if st:
+            result_status = st
         return result_status in ("marked", "clicked", "no checkbox")
 
     await scan_grid(page, visit)
+    await notify(f"☑️ {target_name}: {result_status}")
     return result_status
 
 
@@ -2959,16 +3061,16 @@ async def run_grid_flow(bot, chat_id, well, notify, debug_path):
         await bot.send_message(chat_id, format_grid_message(well, results), parse_mode="HTML")
 
         while True:
-            available = [r["param"] for r in results if r["found"]]
-            if not available:
+            available_items = [r for r in results if r["found"]]
+            if not available_items:
                 await notify("✅ Done")
                 return
 
-            chosen_param = await pick_single_param_to_mark(bot, chat_id, available)
+            chosen_param = await pick_single_param_to_mark(bot, chat_id, available_items)
             if not chosen_param:
                 await notify("✅ Done")
                 return
-
+                
             status = await reset_and_mark_single_param(page, chosen_param, notify)
             await bot.send_message(chat_id, f"☑️ Parameter marked: {chosen_param} ({status})")
 
