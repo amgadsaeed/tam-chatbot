@@ -2,18 +2,24 @@ name: Run ESP Telegram Bot 24/7
 
 concurrency:
   group: telegram-bot-session
-  cancel-in-progress: true # Automatically kills any older running instance!
+  cancel-in-progress: true
 
 on:
   workflow_dispatch:
   push:
     branches: [ "main" ]
   schedule:
-    - cron: '0 */5 * * *'
+    # Backup safety net every 4 hours in case a run ever crashes
+    - cron: '0 */4 * * *'
+
+permissions:
+  actions: write
+  contents: read
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 310 # Runs for ~5 hours, then hands over to the next scheduled run
+    timeout-minutes: 350 # Max allowed is 360 mins (6 hours)
 
     steps:
       - name: Checkout repository
@@ -23,29 +29,35 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      - name: Install dependencies & Playwright Chromium
+      - name: Install dependencies
         run: |
           pip install -r requirements.txt
           playwright install --with-deps chromium
 
-      - name: Restore saved Okta browser session (if cached)
-        uses: actions/cache/restore@v4
+      - name: Restore browser session cache
+        uses: actions/cache@v4
         with:
           path: session_state.json
-          key: okta-session-state
+          key: session-state-${{ github.run_id }}
+          restore-keys: |
+            session-state-
 
-      - name: Run Bot (for 5 hours)
+      - name: Run Bot (for 5 hours 25 minutes)
+        # Runs for 5h 25m (19500s), then exits cleanly so the next step can trigger a fresh run
+        continue-on-error: true
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
           CREDENTIALS_JSON: ${{ secrets.CREDENTIALS_JSON }}
         run: |
-          timeout 18000s python -u bot.py || true
+          timeout 19500s python bot.py || true
 
-      - name: Save Okta browser session for next run
-        uses: actions/cache/save@v4
+      - name: Trigger Next Run Immediately (Zero-Gap Handover)
         if: always()
-        with:
-          path: session_state.json
-          key: okta-session-state-${{ github.run_id }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Triggering next bot session before this runner shuts down..."
+          gh workflow run "run_bot.yml" --ref main || true
