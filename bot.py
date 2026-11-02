@@ -3540,4 +3540,4 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(on_choice, pattern=r"^c\|"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_request))
     print("✅ Bot is online and running...")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=False)
