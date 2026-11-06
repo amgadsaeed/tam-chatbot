@@ -2724,13 +2724,13 @@ async def wait_loading_dialog_gone(page, notify, appear_timeout=6, disappear_tim
     await notify("⚠️ Loading dialog wait timed out; continuing...")
 
 
-async def reset_and_mark_single_param(page, target_name, notify):
+async def reset_and_mark_single_param(page, target_name, notify, well_name="", login_ui=None):
     """Bulletproof single-parameter selector for virtualized jqxGrid:
-    1. Clears any existing selections.
-    2. Scrolls step-by-step until `target_name` is comfortably inside the visible viewport.
-    3. Atomically verifies the label's `actualtagname` in the same JS frame that clicks the checkbox.
-    4. Double-checks all visible rows to confirm ONLY `target_name` is ticked (and unchecks any wrong row).
-    5. Reloads Facility Parameters and retries if verification fails."""
+    1. Confirms via breadcrumb that we are still on `well_name` (re-opens well if needed).
+    2. Never clicks FACILITY_TAB unnecessarily (which can reset the active well).
+    3. Scrolls in controlled steps using jqxGrid scrolloffset.
+    4. Uses Playwright's frame-aware ElementHandle.click() + jqxCheckbox API to toggle checkboxes.
+    5. Double-checks that ONLY `target_name` is checked and visible on screen before screenshot."""
     want_key = norm_name(target_name)
 
     INSPECT_VIEW_JS = """(wantKey) => {
@@ -2752,115 +2752,152 @@ async def reset_and_mark_single_param(page, target_name, notify):
 
             const isChecked = /checkbox-check-checked/i.test(cb.innerHTML) || cb.getAttribute('aria-checked') === 'true';
             if (isChecked) {
-                checkedNames.push({ name: rawName, key: key });
+                checkedNames.push({ name: rawName, key: key, rowId: row.id });
             }
 
             if (key === wantKey) {
                 const rRect = row.getBoundingClientRect();
-                const cbRect = cb.getBoundingClientRect();
                 const relTop = rRect.top - cRect.top;
                 const relBottom = rRect.bottom - cRect.top;
                 const inSafeView = (
                     rRect.height > 0 &&
-                    cbRect.width > 0 &&
                     relTop >= 25 &&
-                    relBottom <= (cRect.height - 10)
+                    relBottom <= (cRect.height - 15)
                 );
                 targetInfo = {
+                    rowId: row.id,
                     name: rawName,
                     key: key,
                     checked: isChecked,
                     relTop: relTop,
                     containerHeight: cRect.height,
                     inSafeView: inSafeView,
-                    x: cbRect.left + cbRect.width / 2,
-                    y: cbRect.top + cbRect.height / 2,
                 };
             }
         }
         return { checkedNames, targetInfo };
     }"""
 
-    UNCHECK_OTHERS_JS = """(wantKey) => {
-        const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-        const rows = [...document.querySelectorAll('div[role="row"][id^="row"][id$="facilitytblcontainer"]')];
-        const unchecked = [];
-        for (const row of rows) {
-            const lab = row.querySelector('div[columnindex="3"] label');
-            if (!lab) continue;
-            const rawName = (lab.getAttribute('actualtagname') || lab.innerText || '').trim();
-            const key = norm(rawName);
-            const cb = row.querySelector('div[columnindex="1"] .jqx-checkbox');
-            if (!cb) continue;
-            const isChecked = /checkbox-check-checked/i.test(cb.innerHTML) || cb.getAttribute('aria-checked') === 'true';
-            if (isChecked && key !== wantKey) {
-                const inner = cb.querySelector('.jqx-checkbox-default') || cb;
-                inner.click();
-                unchecked.push(rawName);
-            }
-        }
-        return unchecked;
-    }"""
+    async def _ensure_correct_well():
+        """Verify the breadcrumb still matches `well_name`; if not, re-open the well and Grid View."""
+        if not well_name:
+            return
+        cleaned = clean_well_name(well_name)
+        expected = f"{get_well_prefix(cleaned)}{cleaned}"
+        current = await get_current_well_name(page)
+        if not current or current.strip().upper() != expected.strip().upper():
+            await notify(f"⚠️ Breadcrumb showed '{current}' instead of '{expected}'. Re-selecting well...")
+            await open_well(well_name, page, notify, login_ui)
+            await ensure_tab_open(page, GRID_TAB, "Grid View", notify)
+            await asyncio.sleep(2.0)
 
-    async def _clear_all_selections(fr, box):
-        """Scan quickly from top to bottom to ensure zero leftover checkboxes are ticked."""
+    async def _toggle_row_checkbox(fr, row_id: str, want_key_check: str, desired_checked: bool):
+        """Click a checkbox inside iframe `fr` using Playwright's native ElementHandle.click()
+        (which properly accounts for iframe offsets) with jqxCheckbox JS fallback."""
+        row_el = await fr.query_selector(f"div#{row_id}")
+        if not row_el:
+            return False
+
+        # Verify the row still holds the expected parameter before clicking
+        lab = await row_el.query_selector('div[columnindex="3"] label')
+        if not lab:
+            return False
+        actual_key = norm_name((await lab.get_attribute("actualtagname")) or (await lab.inner_text()))
+        if want_key_check and actual_key != want_key_check:
+            return False
+
+        cb = await row_el.query_selector('div[columnindex="1"] .jqx-checkbox')
+        if not cb:
+            return False
+
+        currently_checked = await _cb_checked(cb)
+        if currently_checked == desired_checked:
+            return True
+
+        # 1. Primary: Playwright native ElementHandle.click() (frame-aware real mouse event)
         try:
-            await fr.evaluate("""() => {
-                const jq = window.$ || window.jQuery;
-                if (jq && jq('#facilitytblcontainer').length) {
-                    try { jq('#facilitytblcontainer').jqxGrid('clearselection'); } catch (e) {}
-                }
-            }""")
+            await cb.click(timeout=3000, force=True)
+            await asyncio.sleep(0.5)
         except Exception:
             pass
 
-        await _scroll_grid_to(page, fr, box, 0)
-        await asyncio.sleep(0.35)
-        for step in range(25):
-            await fr.evaluate(UNCHECK_OTHERS_JS, want_key)
-            state = await fr.evaluate(INSPECT_VIEW_JS, want_key)
-            await _scroll_grid_to(page, fr, box, (step + 1) * 450)
-            await asyncio.sleep(0.18)
-            new_state = await fr.evaluate(INSPECT_VIEW_JS, want_key)
-            if step > 4 and new_state == state:
-                break
+        if (await _cb_checked(cb)) == desired_checked:
+            return True
 
-    async def _attempt_select(reload_first=False):
-        if reload_first:
-            await notify("🔄 Reloading 'Facility Parameters' tab to reset all checkboxes cleanly...")
-            _, fac_tab = await find_in_frames(page, FACILITY_TAB, timeout=20)
-            if fac_tab:
-                await click(fac_tab)
-                await asyncio.sleep(3.5)
-                await wait_loading_dialog_gone(page, notify, appear_timeout=2.0, disappear_timeout=45)
+        # 2. Secondary: jqxCheckbox native API + mousedown/mouseup/click dispatch
+        await cb.evaluate(
+            """(el, want) => {
+                try {
+                    const jq = window.$ || window.jQuery;
+                    if (jq) {
+                        jq(el).jqxCheckbox(want ? 'check' : 'uncheck');
+                    }
+                } catch (e) {}
+                const target = el.querySelector('.jqx-checkbox-default') || el;
+                for (const evType of [' pointerdown', 'mousedown', 'mouseup', 'click']) {
+                    target.dispatchEvent(new MouseEvent(evType.trim(), { bubbles: true, cancelable: true, view: window }));
+                }
+            }""",
+            desired_checked,
+        )
+        await asyncio.sleep(0.5)
+        return (await _cb_checked(cb)) == desired_checked
+
+    async def _uncheck_wrong_visible_rows(fr):
+        """Uncheck any visible row in the current viewport whose key != want_key."""
+        view = await fr.evaluate(INSPECT_VIEW_JS, want_key)
+        for item in view.get("checkedNames") or []:
+            if item["key"] != want_key:
+                await _toggle_row_checkbox(fr, item["rowId"], item["key"], desired_checked=False)
+                await notify(f"🧹 Unchecked other parameter: {item['name']}")
+                await asyncio.sleep(0.25)
+
+    async def _attempt_select(sweep_uncheck_all=False):
+        await _ensure_correct_well()
 
         await notify(f"⏳ Waiting 3s before selecting '{target_name}'...")
         await asyncio.sleep(3.0)
 
         fr = await grid_frame(page)
         if not fr:
+            # Wait up to 10s for the grid frame to appear
+            for _ in range(20):
+                fr = await grid_frame(page)
+                if fr:
+                    break
+                await asyncio.sleep(0.5)
+        if not fr:
             raise Exception("Facility Parameters grid frame not found.")
 
         content = await fr.query_selector("#contentfacilitytblcontainer")
         box = await content.bounding_box() if content else None
 
-        if not reload_first:
-            await _clear_all_selections(fr, box)
+        # Optional full sweep from top to bottom to uncheck any old ticked parameters
+        if sweep_uncheck_all:
+            await _scroll_grid_to(page, fr, box, 0)
+            await asyncio.sleep(0.35)
+            for s in range(25):
+                await _uncheck_wrong_visible_rows(fr)
+                before_v = await fr.evaluate(INSPECT_VIEW_JS, want_key)
+                await _scroll_grid_to(page, fr, box, (s + 1) * 450)
+                await asyncio.sleep(0.2)
+                after_v = await fr.evaluate(INSPECT_VIEW_JS, want_key)
+                if s > 3 and after_v == before_v:
+                    break
 
+        # Scroll to top and step down in 220px increments to find, center, and tick `target_name`
         await _scroll_grid_to(page, fr, box, 0)
         await asyncio.sleep(0.4)
 
         current_scroll_y = 0
         for step in range(45):
-            wrong_unchecked = await fr.evaluate(UNCHECK_OTHERS_JS, want_key)
-            if wrong_unchecked:
-                await notify(f"🧹 Unchecked wrong parameter(s): {', '.join(wrong_unchecked)}")
-                await asyncio.sleep(0.3)
+            await _uncheck_wrong_visible_rows(fr)
 
             view = await fr.evaluate(INSPECT_VIEW_JS, want_key)
             t_info = view.get("targetInfo")
 
             if t_info:
+                # Center the row in the grid viewport if it's near the top/bottom edge
                 if not t_info["inSafeView"]:
                     desired_rel_top = 110
                     delta = t_info["relTop"] - desired_rel_top
@@ -2871,31 +2908,12 @@ async def reset_and_mark_single_param(page, target_name, notify):
                     t_info = view.get("targetInfo")
 
                 if t_info:
-                    if not t_info["checked"]:
-                        await page.mouse.click(t_info["x"], t_info["y"])
-                        await asyncio.sleep(0.7)
+                    # Tick the target row using Playwright's frame-aware ElementHandle.click()
+                    await _toggle_row_checkbox(fr, t_info["rowId"], want_key, desired_checked=True)
+                    await asyncio.sleep(0.4)
 
-                    verify1 = await fr.evaluate(INSPECT_VIEW_JS, want_key)
-                    t_after = verify1.get("targetInfo")
-                    if t_after and not t_after["checked"]:
-                        await fr.evaluate("""(wantKey) => {
-                            const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                            for (const row of document.querySelectorAll('div[role="row"][id^="row"][id$="facilitytblcontainer"]')) {
-                                const lab = row.querySelector('div[columnindex="3"] label');
-                                if (!lab) continue;
-                                const key = norm(lab.getAttribute('actualtagname') || lab.innerText || '');
-                                if (key === wantKey) {
-                                    const cb = row.querySelector('div[columnindex="1"] .jqx-checkbox-default')
-                                            || row.querySelector('div[columnindex="1"] .jqx-checkbox');
-                                    if (cb) cb.click();
-                                    break;
-                                }
-                            }
-                        }""", want_key)
-                        await asyncio.sleep(0.7)
-
-                    await fr.evaluate(UNCHECK_OTHERS_JS, want_key)
-                    await asyncio.sleep(0.3)
+                    # Ensure no neighbor row is checked
+                    await _uncheck_wrong_visible_rows(fr)
 
                     final_view = await fr.evaluate(INSPECT_VIEW_JS, want_key)
                     final_target = final_view.get("targetInfo")
@@ -2921,21 +2939,21 @@ async def reset_and_mark_single_param(page, target_name, notify):
 
             current_scroll_y += 220
             await _scroll_grid_to(page, fr, box, current_scroll_y)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.28)
 
         return "not found"
 
+    # Attempt 1: Uncheck any visible boxes and select directly without reloading tabs
     for attempt in range(1, 3):
         try:
-            status = await _attempt_select(reload_first=True)
+            status = await _attempt_select(sweep_uncheck_all=(attempt > 1))
             if status == "marked":
                 return status
-            await notify(f"⚠️ Verification attempt {attempt}/2 returned '{status}'. Retrying with fresh reload...")
+            await notify(f"⚠️ Selection attempt {attempt}/2 returned '{status}'. Retrying...")
         except Exception as e:
             await notify(f"⚠️ Error on selection attempt {attempt}/2 ({str(e)[:120]}). Retrying...")
 
     raise Exception(f"Could not verify that '{target_name}' was accurately marked after 2 full attempts.")
-
 
 async def run_demand_scan(bot, chat_id, well, page, notify, debug_path):
     """Click Demand Scan -> click Ok if confirmation appears, or skip if loading bar appears directly ->
@@ -3242,8 +3260,9 @@ async def browser_page(debug_path):
 async def run_grid_flow(bot, chat_id, well, notify, debug_path):
     """Open Facility Parameters, send values, and loop allowing the user to select a parameter,
     perform Demand Scan or Edit Alarm Settings, view updated values, and repeat until End Session."""
+    login_ui = LoginUI(bot, chat_id)
     async with browser_page(debug_path) as page:
-        results = await capture_grid_view(well, page, notify, LoginUI(bot, chat_id))
+        results = await capture_grid_view(well, page, notify, login_ui)
         await bot.send_message(chat_id, format_grid_message(well, results), parse_mode="HTML")
 
         while True:
@@ -3257,7 +3276,9 @@ async def run_grid_flow(bot, chat_id, well, notify, debug_path):
                 await notify("✅ Done")
                 return
 
-            status = await reset_and_mark_single_param(page, chosen_param, notify)
+            status = await reset_and_mark_single_param(
+                page, chosen_param, notify, well_name=well, login_ui=login_ui
+            )
             await bot.send_message(chat_id, f"☑️ Parameter marked: {chosen_param} ({status})")
 
             try:
@@ -3287,11 +3308,8 @@ async def run_grid_flow(bot, chat_id, well, notify, debug_path):
                 await run_demand_scan(bot, chat_id, well, page, notify, debug_path)
             elif action == "alarm_settings":
                 await run_edit_alarm_settings(bot, chat_id, well, chosen_param, page, notify, debug_path)
-                _, fac_tab = await find_in_frames(page, FACILITY_TAB, timeout=15)
-                if fac_tab:
-                    await click(fac_tab)
-                    await asyncio.sleep(1.0)
-                    await wait_loading_dialog_gone(page, notify, appear_timeout=1.2, disappear_timeout=45)
+                await asyncio.sleep(1.0)
+                await wait_loading_dialog_gone(page, notify, appear_timeout=1.5, disappear_timeout=45)
 
             results = await collect_grid_params(page, notify, well_name=well)
             await bot.send_message(chat_id, format_grid_message(well, results), parse_mode="HTML")
