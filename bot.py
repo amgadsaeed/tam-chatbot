@@ -40,17 +40,25 @@ GEMINI_KEY = os.environ["GEMINI_KEY"]
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 
 DEFAULT_FALLBACK_MODELS = ",".join([
-    # Gemini 3 Series (Active Stable & Preview Multimodal Models)
+    # Gemini 3 & 4 Series (Active Stable & Preview Multimodal Models)
     "gemini-3.6-flash",
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
+    "gemini-4-argon",
     "gemini-3.1-pro-preview",
+    "gemini-3-flash-preview",
 
-    # Gemini 2.5 Series (Active Multimodal Models)
+    # Gemini 2.5 Series (Legacy Active Fallbacks)
     "gemini-2.5-flash",
     "gemini-2.5-pro",
     "gemini-2.5-flash-lite",
 ])
+
+GEMINI_FALLBACKS = [
+    m.strip()
+    for m in os.environ.get("GEMINI_FALLBACKS", DEFAULT_FALLBACK_MODELS).split(",")
+    if m.strip()
+]
 
 GEMINI_FALLBACKS = [
     m.strip()
@@ -75,9 +83,9 @@ CHART_TZ = os.environ.get("CHART_TZ", "Africa/Cairo")
 # Report parameters: exact order and names used in the WhatsApp report
 PARAM_ORDER = ["PIP", "PD", "Motor Amp", "Tm"]
 PARAM_FULL = {
-    "PIP": "Pump Intake Pressure / Press-Pump Intake",
+    "PIP": "Pump Intake Pressure / Press-Pump Intake (or Press-Suction)",
     "PD": "Press-Pump Discharge",
-    "Motor Amp": "Pwr-Motor Amps Ph B",
+    "Motor Amp": "Pwr-Motor Amps Ph B (or Pwr-Output Amps Ph B)",
     "Tm": "Temp-Motor",
 }
 
@@ -113,6 +121,7 @@ HPUMP_GRID_PARAMS = [
     "Temp-Motor PH A Hpump",
     "Temp-HTC",
     "Pwr-Output Amps Ph B",
+    "Pwr-Motor Amps Ph B",
     "Pwr-Output Volts AB",
 ]
 
@@ -143,14 +152,22 @@ CUSTOM_CHAR_DELAY_SEC = 0.2        # pause between typed characters
 CUSTOM_AFTER_TYPE_SEC = 1.5        # after typing a value, before checking it
 CUSTOM_AFTER_SET_SEC = 12          # after clicking "Set"
 
-# Page selectors
+# Page selectors (supports both ESP and HPUMP curve tag names)
 TRENDS_TAB = "a[onclick*='showTrends']"
 GRID_TAB = "a[onclick*='showTabularView']"
 FACILITY_TAB = 'a[onclick*="getTableData"][onclick*="Facility Parameter"]'
 CHART_SEL = 'div[data-dojo-type="ProductionChart"]'
 POINT_TARGET_SELECTOR = 'rect.highcharts-background'
-PD_TAG_SEL = 'div.tagContainer[name="Press-Pump Discharge"], div.tagContainer[channeldisplay="Press-Pump Discharge"]'
-PIP_TAG_SEL = 'div.tagContainer[name*="Press-Pump Intake"], div.tagContainer[channeldisplay*="Press-Pump Intake"]'
+PD_TAG_SEL = (
+    'div.tagContainer[name="Press-Pump Discharge"], '
+    'div.tagContainer[channeldisplay="Press-Pump Discharge"]'
+)
+PIP_TAG_SEL = (
+    'div.tagContainer[name*="Press-Pump Intake"], '
+    'div.tagContainer[channeldisplay*="Press-Pump Intake"], '
+    'div.tagContainer[name*="Press-Suction"], '
+    'div.tagContainer[channeldisplay*="Press-Suction"]'
+)
 
 # Export selectors
 EXPORT_ICON_SEL = 'img[id$="dataExport"], div.export-icon-trendchart img[title="Export Chart"], div.export-icon-trendchart'
@@ -1002,7 +1019,7 @@ async def open_well(well_name, page, notify, login_ui):
 
 
 # =====================================================================================
-# Trends: chart well title, period estimation ("Last Day" for 1 D, or hours), PD/PIP toggle
+# Trends: chart well title, period estimation ("Last Day" for 1 D, or hours/days), PD/PIP toggle
 # =====================================================================================
 async def get_chart_well_name(page, fallback=""):
     """Read the well name from <div id='Gauge_...chartHeader_Title' class='chart-header-title'>FAJR-48</div>."""
@@ -1113,26 +1130,6 @@ def compute_period_label(period: dict, range_text: str = "") -> str:
         hours = (period["end"] - period["start"]).total_seconds() / 3600.0
         if hours > 0:
             return _format_period_duration(hours)
-
-    return "Last Day"
-
-    if period and period.get("type") == "custom" and period.get("start") and period.get("end"):
-        hours = (period["end"] - period["start"]).total_seconds() / 3600.0
-        if hours > 0:
-            return _format_hours_half(hours)
-
-    preset_hours = {
-        "3D": 72,
-        "1W": 168,
-        "2W": 336,
-        "1M": 720,
-        "2M": 1440,
-        "1Y": 8760,
-    }
-    if period and period.get("type") == "preset":
-        key = re.sub(r"\s+", "", period.get("label", "")).upper()
-        if key in preset_hours:
-            return _format_hours_half(preset_hours[key])
 
     return "Last Day"
 
@@ -1374,20 +1371,20 @@ def _unzip_and_collect_excels(downloaded_path: str, extract_dir: str) -> list:
 
 
 def _match_target_col(col_name: str):
-    """Match an Excel column header to one of the 6 target ESP parameters."""
+    """Match an Excel column header to one of the 6 target ESP/HPUMP parameters."""
     c = re.sub(r"\s+", " ", (col_name or "").strip()).lower()
-    if "press-pump intake" in c or "(pi)" in c:
-        return "PIP", "Press-Pump Intake (Pi)[psi]"
+    if "press-pump intake" in c or "(pi)" in c or "press-suction" in c:
+        return "PIP", col_name.strip() or "Press-Pump Intake (Pi)[psi]"
     if "press-pump discharge" in c:
-        return "PD", "Press-Pump Discharge[psi]"
-    if "pwr-motor amps ph b" in c or "motor amps" in c:
-        return "Motor Amp", "Pwr-Motor Amps Ph B[A]"
+        return "PD", col_name.strip() or "Press-Pump Discharge[psi]"
+    if "pwr-motor amps" in c or "pwr-output amps" in c or "motor amps" in c:
+        return "Motor Amp", col_name.strip() or "Pwr-Motor Amps Ph B[A]"
     if "status-hz" in c:
-        return "Frequency (Hz)", "Status-Hz[Hz]"
-    if "temp-motor" in c:
-        return "Tm", "Temp-Motor[degF]"
-    if "vib-pump x" in c:
-        return "Vibration (Vx)", "Vib-Pump X axis[G]"
+        return "Frequency (Hz)", col_name.strip() or "Status-Hz[Hz]"
+    if "temp-motor" in c and "intake" not in c:
+        return "Tm", col_name.strip() or "Temp-Motor[degF]"
+    if "vib-pump x" in c or "vib-hpump" in c:
+        return "Vibration (Vx)", col_name.strip() or "Vib-Pump X axis[G]"
     return None, None
 
 
@@ -1434,7 +1431,10 @@ def extract_excel_text_for_ai(excel_paths: list, max_chars: int = 40000) -> str:
             header_idx = 0
             for idx, r in enumerate(all_rows[:20]):
                 joined = " ".join(r).lower()
-                if any(k in joined for k in ("status-hz", "temp-motor", "press-pump", "pwr-motor")):
+                if any(
+                    k in joined
+                    for k in ("status-hz", "temp-motor", "press-pump", "press-suction", "pwr-motor", "pwr-output")
+                ):
                     header_idx = idx
                     break
 
@@ -1824,7 +1824,7 @@ async def render_and_screenshot_chart(
     await notify(f"🏷 Chart header well: {chart_well_name} | Period: {period_label}")
 
     # Toggle PIP and PD visibility (also closes any existing freeze points)
-    await set_tag_visibility_on_chart(page, PIP_TAG_SEL, "PIP (Press-Pump Intake)", remove_pip, notify)
+    await set_tag_visibility_on_chart(page, PIP_TAG_SEL, "PIP (Press-Pump Intake / Suction)", remove_pip, notify)
     await set_tag_visibility_on_chart(page, PD_TAG_SEL, "PD (Press-Pump Discharge)", remove_pd, notify)
 
     if remove_pip or remove_pd:
@@ -1872,6 +1872,7 @@ async def render_and_screenshot_chart(
             await notify(f"⚠️ Could not export Excel sheet: {str(e)[:200]} (continuing with screenshot)")
 
     return chart_well_name, period_label, excel_files
+
 
 async def capture_chart_advanced(
     well_name,
@@ -1973,8 +1974,9 @@ GRID_JS = """() => {
   return out;
 }"""
 
-# Remembers {normalized_param_name: rowindex} from the latest scan so marking is instant
+# Remembers {normalized_param_name: rowindex} from the latest scan
 LAST_GRID_ROW_INDEX = {}
+_LAST_SCROLL_Y = 0
 
 
 def norm_name(s):
@@ -1993,12 +1995,14 @@ async def grid_frame(page):
 
 
 async def _scroll_grid_to(page, fr, box, y_px: int):
-    """Scroll the jqxGrid to vertical offset `y_px` using its native JS API or fast mouse wheel."""
+    """Scroll the jqxGrid to vertical offset `y_px` using its native JS API or proportional mouse wheel."""
+    global _LAST_SCROLL_Y
     used_js = await fr.evaluate(
         """(y) => {
             try {
-                if (window.$ && $('#facilitytblcontainer').length) {
-                    $('#facilitytblcontainer').jqxGrid('scrolloffset', y, 0);
+                const jq = window.$ || window.jQuery;
+                if (jq && jq('#facilitytblcontainer').length) {
+                    jq('#facilitytblcontainer').jqxGrid('scrolloffset', y, 0);
                     return true;
                 }
             } catch (e) {}
@@ -2008,11 +2012,19 @@ async def _scroll_grid_to(page, fr, box, y_px: int):
     )
     if not used_js and box:
         await page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-        await page.mouse.wheel(0, 650 if y_px > 0 else -5000)
+        if y_px <= 0:
+            for _ in range(5):
+                await page.mouse.wheel(0, -3000)
+                await asyncio.sleep(0.05)
+        else:
+            delta = y_px - _LAST_SCROLL_Y
+            if delta != 0:
+                await page.mouse.wheel(0, delta)
+    _LAST_SCROLL_Y = max(0, y_px)
 
 
 async def scan_grid(page, visit, max_steps=35):
-    """Fast virtual-grid scanner: uses jqxGrid scrolloffset (or 650px wheel jumps) with 0.22s pauses."""
+    """Fast virtual-grid scanner: uses jqxGrid scrolloffset (or wheel delta) with 0.22s pauses."""
     fr = None
     for _ in range(80):  # poll every 0.4s (up to 32s)
         try:
@@ -2054,7 +2066,7 @@ async def scan_grid(page, visit, max_steps=35):
         if stale >= 2:
             break
 
-        # Advance 18 rows (~500-650px) per step
+        # Advance ~500px per step
         await _scroll_grid_to(page, fr, box, (step + 1) * 500)
         await asyncio.sleep(0.22)
     return None
@@ -2133,6 +2145,7 @@ def format_grid_message(well, results):
             lines.append(f"{i}. <b>{name}</b>\n    ⚠️ not found in the grid")
     return "\n".join(lines)
 
+
 # =====================================================================================
 # Gemini analysis and report (with Excel data + multi-round model retry)
 # =====================================================================================
@@ -2149,7 +2162,7 @@ def _fast_gen_config(model_name: str, json_mode: bool = False):
         kwargs["response_mime_type"] = "application/json"
 
     try:
-        if "pro" in model_name.lower():
+        if "pro" in model_name.lower() or "argon" in model_name.lower():
             kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=128)
         else:
             kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
@@ -2199,7 +2212,7 @@ def build_prompt(
     pip_instruction = (
         '- "PIP": Intentionally hidden/removed by the user; set "PIP" status to "not_visible" with empty text.'
         if remove_pip
-        else '- "PIP"            = Excel column "Press-Pump Intake (Pi)[psi]"'
+        else '- "PIP"            = Excel column "Press-Pump Intake (Pi)[psi]" (or "Press-Suction[psi]" on HPUMP)'
     )
     pd_instruction = (
         '- "PD": Intentionally hidden/removed by the user; set "PD" status to "not_visible" with empty text.'
@@ -2239,10 +2252,10 @@ Return ONLY one JSON object (no markdown, no code fence) with exactly this struc
 EXACT EXCEL COLUMN MAPPING (MANDATORY):
 {pip_instruction}
 {pd_instruction}
-- "Motor Amp"      = Excel column "Pwr-Motor Amps Ph B[A]"
+- "Motor Amp"      = Excel column "Pwr-Motor Amps Ph B[A]" (or "Pwr-Output Amps Ph B[A]")
 - "Frequency (Hz)" = Excel column "Status-Hz[Hz]" (describe this inside the "Motor Amp" text!)
-- "Tm"             = Excel column "Temp-Motor[degF]"
-- "Vibration (Vx)" = Excel column "Vib-Pump X axis[G]" (put this inside "extras" if present and non-empty)
+- "Tm"             = Excel column "Temp-Motor[degF]" (or HPUMP Motor Temp column)
+- "Vibration (Vx)" = Excel column "Vib-Pump X axis[G]" (or "Vib-HPump[G]"; put this inside "extras" if present and non-empty)
 
 STRICT EXCLUSIONS (DO NOT analyze or include these under any circumstances):
 - NEVER include "Vibration (Vy)" or "Vib-Pump Y axis[G]".
@@ -2273,7 +2286,7 @@ HOW TO WRITE "text" — COMPLETE YET BRIEF CHRONOLOGICAL PROGRESSION (MANDATORY)
 - Motor Amp must ALWAYS include Frequency from "Status-Hz[Hz]" (including any Hz changes, or "... while Frequency was constant at X Hz").
 - If the Excel data shows the well shut down (Amps and Hz dropping to 0) or restarted during the period, mention it briefly inside the relevant texts.
 
-"extras": include "Vibration (Vx)" (from "Vib-Pump X axis[G]") here using the same style. Do not put the four main parameters or excluded parameters here.
+"extras": include "Vibration (Vx)" (from "Vib-Pump X axis[G]" or "Vib-HPump[G]") here using the same style. Do not put the four main parameters or excluded parameters here.
 
 Write in English.{excel_section}"""
 
@@ -2401,12 +2414,12 @@ The user wants to edit/update this observation with the following instruction:
 "{user_instruction}"
 
 EXACT EXCEL COLUMN MAPPING:
-- Pwr-Motor Amps Ph B[A] is for Motor Amp
+- Pwr-Motor Amps Ph B[A] (or Pwr-Output Amps Ph B[A]) is for Motor Amp
 - Status-Hz[Hz] is for Frequency (Hz)
-- Press-Pump Intake (Pi)[psi] is for PIP
+- Press-Pump Intake (Pi)[psi] (or Press-Suction[psi]) is for PIP
 - Press-Pump Discharge[psi] is for PD
 - Temp-Motor[degF] is for Tm
-- Vib-Pump X axis[G] is for Vibration (Vx)
+- Vib-Pump X axis[G] (or Vib-HPump[G]) is for Vibration (Vx)
 
 STRICT RULES:
 1. Base all numerical readings strictly on the exported Excel data below (not visual guessing from the screenshot).
@@ -2720,7 +2733,6 @@ async def reset_and_mark_single_param(page, target_name, notify):
     5. Reloads Facility Parameters and retries if verification fails."""
     want_key = norm_name(target_name)
 
-    # Atomic JS helper: returns the current visible state of all rows in the viewport
     INSPECT_VIEW_JS = """(wantKey) => {
         const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
         const container = document.querySelector('#contentfacilitytblcontainer') || document.body;
@@ -2769,7 +2781,6 @@ async def reset_and_mark_single_param(page, target_name, notify):
         return { checkedNames, targetInfo };
     }"""
 
-    # Uncheck any row in the current view whose key != want_key
     UNCHECK_OTHERS_JS = """(wantKey) => {
         const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
         const rows = [...document.querySelectorAll('div[role="row"][id^="row"][id$="facilitytblcontainer"]')];
@@ -2795,8 +2806,9 @@ async def reset_and_mark_single_param(page, target_name, notify):
         """Scan quickly from top to bottom to ensure zero leftover checkboxes are ticked."""
         try:
             await fr.evaluate("""() => {
-                if (window.$ && $('#facilitytblcontainer').length) {
-                    try { $('#facilitytblcontainer').jqxGrid('clearselection'); } catch (e) {}
+                const jq = window.$ || window.jQuery;
+                if (jq && jq('#facilitytblcontainer').length) {
+                    try { jq('#facilitytblcontainer').jqxGrid('clearselection'); } catch (e) {}
                 }
             }""")
         except Exception:
@@ -2807,7 +2819,6 @@ async def reset_and_mark_single_param(page, target_name, notify):
         for step in range(25):
             await fr.evaluate(UNCHECK_OTHERS_JS, want_key)
             state = await fr.evaluate(INSPECT_VIEW_JS, want_key)
-            # Also check if we reached the bottom
             await _scroll_grid_to(page, fr, box, (step + 1) * 450)
             await asyncio.sleep(0.18)
             new_state = await fr.evaluate(INSPECT_VIEW_JS, want_key)
@@ -2833,17 +2844,14 @@ async def reset_and_mark_single_param(page, target_name, notify):
         content = await fr.query_selector("#contentfacilitytblcontainer")
         box = await content.bounding_box() if content else None
 
-        # If we didn't just reload the tab, sweep and uncheck any previously checked rows
         if not reload_first:
             await _clear_all_selections(fr, box)
 
-        # Scroll back to top and step down in controlled 220px increments until target_name is in the safe viewport
         await _scroll_grid_to(page, fr, box, 0)
         await asyncio.sleep(0.4)
 
         current_scroll_y = 0
         for step in range(45):
-            # Always uncheck any wrong checked box we pass along the way
             wrong_unchecked = await fr.evaluate(UNCHECK_OTHERS_JS, want_key)
             if wrong_unchecked:
                 await notify(f"🧹 Unchecked wrong parameter(s): {', '.join(wrong_unchecked)}")
@@ -2853,9 +2861,8 @@ async def reset_and_mark_single_param(page, target_name, notify):
             t_info = view.get("targetInfo")
 
             if t_info:
-                # If the row is too close to the bottom or top edge of the grid, nudge scroll to center it
                 if not t_info["inSafeView"]:
-                    desired_rel_top = 110  # ~4 rows below the grid header
+                    desired_rel_top = 110
                     delta = t_info["relTop"] - desired_rel_top
                     current_scroll_y = max(0, int(current_scroll_y + delta))
                     await _scroll_grid_to(page, fr, box, current_scroll_y)
@@ -2864,12 +2871,10 @@ async def reset_and_mark_single_param(page, target_name, notify):
                     t_info = view.get("targetInfo")
 
                 if t_info:
-                    # Click the exact coordinates of the checkbox for `want_key` (or skip click if already checked)
                     if not t_info["checked"]:
                         await page.mouse.click(t_info["x"], t_info["y"])
                         await asyncio.sleep(0.7)
 
-                    # Re-verify in DOM; if mouse click didn't toggle it, use atomic JS click on the exact matched row
                     verify1 = await fr.evaluate(INSPECT_VIEW_JS, want_key)
                     t_after = verify1.get("targetInfo")
                     if t_after and not t_after["checked"]:
@@ -2889,7 +2894,6 @@ async def reset_and_mark_single_param(page, target_name, notify):
                         }""", want_key)
                         await asyncio.sleep(0.7)
 
-                    # Clean up any accidental neighbor check and run final double-check
                     await fr.evaluate(UNCHECK_OTHERS_JS, want_key)
                     await asyncio.sleep(0.3)
 
@@ -2915,14 +2919,12 @@ async def reset_and_mark_single_param(page, target_name, notify):
                         )
                         return "mismatch"
 
-            # Advance down by 220px (~8 rows) so we never skip over a row
             current_scroll_y += 220
             await _scroll_grid_to(page, fr, box, current_scroll_y)
             await asyncio.sleep(0.3)
 
         return "not found"
 
-    # Attempt 1: Reload Facility Parameters first so the grid starts 100% clean with 0 checked boxes, then select & verify
     for attempt in range(1, 3):
         try:
             status = await _attempt_select(reload_first=True)
@@ -2933,6 +2935,7 @@ async def reset_and_mark_single_param(page, target_name, notify):
             await notify(f"⚠️ Error on selection attempt {attempt}/2 ({str(e)[:120]}). Retrying...")
 
     raise Exception(f"Could not verify that '{target_name}' was accurately marked after 2 full attempts.")
+
 
 async def run_demand_scan(bot, chat_id, well, page, notify, debug_path):
     """Click Demand Scan -> click Ok if confirmation appears, or skip if loading bar appears directly ->
@@ -3008,7 +3011,7 @@ async def run_edit_alarm_settings(bot, chat_id, well, param_name, page, notify, 
     if not edit_btn:
         raise Exception("Edit Alarm Settings button (#exceptionSettingAnchor) was not found.")
     await click(edit_btn)
-    await asyncio.sleep(1.0)  # WAS: 4s (find_in_frames below polls automatically)
+    await asyncio.sleep(1.0)
 
     _, dlg_el = await find_in_frames(
         page, 'div[aria-describedby="prodExceptionSettingsDiv"], #prodExceptionSettingsDiv', timeout=20, need_size=True
@@ -3017,7 +3020,7 @@ async def run_edit_alarm_settings(bot, chat_id, well, param_name, page, notify, 
         raise Exception("Alarm Settings popup (#prodExceptionSettingsDiv) did not appear.")
 
     alarm_frame = None
-    for _ in range(40):  # Poll every 0.3s (WAS: 1.0s) until the iframe buttons are ready
+    for _ in range(40):
         for fr in page.frames:
             if "alarmSettings.do" in (fr.url or "") or fr.name == "prodExceptionSettingsFrame":
                 try:
@@ -3039,7 +3042,7 @@ async def run_edit_alarm_settings(bot, chat_id, well, param_name, page, notify, 
     if not alarm_frame:
         raise Exception("Could not locate the inner Alarm Settings iframe (#prodExceptionSettingsFrame).")
 
-    await asyncio.sleep(0.5)  # WAS: 2s (buttons are already in the DOM)
+    await asyncio.sleep(0.5)
 
     async def send_popup_screenshot(caption):
         shot = debug_path.replace("debug_error", "alarm_settings")
@@ -3140,13 +3143,13 @@ async def run_edit_alarm_settings(bot, chat_id, well, param_name, page, notify, 
         await inp_el.evaluate("e => { e.click(); e.focus(); e.value = ''; }")
         await page.keyboard.press("Control+A")
         await page.keyboard.press("Delete")
-        await asyncio.sleep(0.1)  # WAS: 0.3s
+        await asyncio.sleep(0.1)
         if new_val:
-            await page.keyboard.type(new_val, delay=15)  # WAS: delay=60
+            await page.keyboard.type(new_val, delay=15)
         await inp_el.evaluate(
             "e => { e.dispatchEvent(new Event('input', {bubbles:true})); e.dispatchEvent(new Event('change', {bubbles:true})); }"
         )
-        await asyncio.sleep(0.15)  # WAS: 0.5s
+        await asyncio.sleep(0.15)
 
         f["value"] = await inp_el.input_value()
         await notify(f"✏️ Set '{f['label']}' → '{f['value']}'")
@@ -3171,7 +3174,7 @@ async def run_edit_alarm_settings(bot, chat_id, well, param_name, page, notify, 
         if not save_btn:
             raise Exception("Save button (#setAlarmSettingsButton) was not found.")
         await click(save_btn)
-        await asyncio.sleep(1.0)  # WAS: 4s
+        await asyncio.sleep(1.0)
         await wait_loading_dialog_gone(page, notify, appear_timeout=1.5, disappear_timeout=60)
         await bot.send_message(chat_id, f"✅ Alarm Settings saved for {param_name}.")
     else:
@@ -3182,7 +3185,7 @@ async def run_edit_alarm_settings(bot, chat_id, well, param_name, page, notify, 
         if not close_btn:
             raise Exception("Close button (#closeAlarmSettingsButton) was not found.")
         await click(close_btn)
-        await asyncio.sleep(0.5)  # WAS: 2s
+        await asyncio.sleep(0.5)
         await bot.send_message(chat_id, f"❎ Alarm Settings closed without saving for {param_name}.")
 
 
@@ -3253,7 +3256,7 @@ async def run_grid_flow(bot, chat_id, well, notify, debug_path):
             if not chosen_param:
                 await notify("✅ Done")
                 return
-                
+
             status = await reset_and_mark_single_param(page, chosen_param, notify)
             await bot.send_message(chat_id, f"☑️ Parameter marked: {chosen_param} ({status})")
 
@@ -3287,8 +3290,8 @@ async def run_grid_flow(bot, chat_id, well, notify, debug_path):
                 _, fac_tab = await find_in_frames(page, FACILITY_TAB, timeout=15)
                 if fac_tab:
                     await click(fac_tab)
-                    await asyncio.sleep(1.0)  # WAS: 3s
-                    await wait_loading_dialog_gone(page, notify, appear_timeout=1.2, disappear_timeout=45)  # WAS: appear_timeout=3
+                    await asyncio.sleep(1.0)
+                    await wait_loading_dialog_gone(page, notify, appear_timeout=1.2, disappear_timeout=45)
 
             results = await collect_grid_params(page, notify, well_name=well)
             await bot.send_message(chat_id, format_grid_message(well, results), parse_mode="HTML")
