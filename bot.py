@@ -2712,36 +2712,117 @@ async def wait_loading_dialog_gone(page, notify, appear_timeout=6, disappear_tim
 
 
 async def reset_and_mark_single_param(page, target_name, notify):
-    """Wait 3s, scroll the target parameter into view, uncheck any other rows, and tick `target_name`.
-    If marking fails or raises an error, reload Facility Parameters and retry automatically."""
+    """Bulletproof single-parameter selector for virtualized jqxGrid:
+    1. Clears any existing selections.
+    2. Scrolls step-by-step until `target_name` is comfortably inside the visible viewport.
+    3. Atomically verifies the label's `actualtagname` in the same JS frame that clicks the checkbox.
+    4. Double-checks all visible rows to confirm ONLY `target_name` is ticked (and unchecks any wrong row).
+    5. Reloads Facility Parameters and retries if verification fails."""
     want_key = norm_name(target_name)
 
-    async def _scroll_row_into_center(fr, row_el, row_idx=None):
-        """Ensure the selected parameter row is centered and clearly visible inside the grid before screenshot."""
-        content = await fr.query_selector("#contentfacilitytblcontainer")
-        box = await content.bounding_box() if content else None
-        if row_idx is not None:
-            # Scroll so the target row sits ~3-4 rows below the top header (clearly visible in the screenshot)
-            target_y = max(0, (row_idx - 3) * 28)
-            await _scroll_grid_to(page, fr, box, target_y)
-            await asyncio.sleep(0.6)
-        if row_el:
-            try:
-                await row_el.scroll_into_view_if_needed()
-                await asyncio.sleep(0.4)
-            except Exception:
-                pass
+    # Atomic JS helper: returns the current visible state of all rows in the viewport
+    INSPECT_VIEW_JS = """(wantKey) => {
+        const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+        const container = document.querySelector('#contentfacilitytblcontainer') || document.body;
+        const cRect = container.getBoundingClientRect();
+
+        const rows = [...document.querySelectorAll('div[role="row"][id^="row"][id$="facilitytblcontainer"]')];
+        const checkedNames = [];
+        let targetInfo = null;
+
+        for (const row of rows) {
+            const lab = row.querySelector('div[columnindex="3"] label');
+            if (!lab) continue;
+            const rawName = (lab.getAttribute('actualtagname') || lab.innerText || '').trim();
+            const key = norm(rawName);
+            const cb = row.querySelector('div[columnindex="1"] .jqx-checkbox');
+            if (!cb) continue;
+
+            const isChecked = /checkbox-check-checked/i.test(cb.innerHTML) || cb.getAttribute('aria-checked') === 'true';
+            if (isChecked) {
+                checkedNames.push({ name: rawName, key: key });
+            }
+
+            if (key === wantKey) {
+                const rRect = row.getBoundingClientRect();
+                const cbRect = cb.getBoundingClientRect();
+                const relTop = rRect.top - cRect.top;
+                const relBottom = rRect.bottom - cRect.top;
+                const inSafeView = (
+                    rRect.height > 0 &&
+                    cbRect.width > 0 &&
+                    relTop >= 25 &&
+                    relBottom <= (cRect.height - 10)
+                );
+                targetInfo = {
+                    name: rawName,
+                    key: key,
+                    checked: isChecked,
+                    relTop: relTop,
+                    containerHeight: cRect.height,
+                    inSafeView: inSafeView,
+                    x: cbRect.left + cbRect.width / 2,
+                    y: cbRect.top + cbRect.height / 2,
+                };
+            }
+        }
+        return { checkedNames, targetInfo };
+    }"""
+
+    # Uncheck any row in the current view whose key != want_key
+    UNCHECK_OTHERS_JS = """(wantKey) => {
+        const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+        const rows = [...document.querySelectorAll('div[role="row"][id^="row"][id$="facilitytblcontainer"]')];
+        const unchecked = [];
+        for (const row of rows) {
+            const lab = row.querySelector('div[columnindex="3"] label');
+            if (!lab) continue;
+            const rawName = (lab.getAttribute('actualtagname') || lab.innerText || '').trim();
+            const key = norm(rawName);
+            const cb = row.querySelector('div[columnindex="1"] .jqx-checkbox');
+            if (!cb) continue;
+            const isChecked = /checkbox-check-checked/i.test(cb.innerHTML) || cb.getAttribute('aria-checked') === 'true';
+            if (isChecked && key !== wantKey) {
+                const inner = cb.querySelector('.jqx-checkbox-default') || cb;
+                inner.click();
+                unchecked.push(rawName);
+            }
+        }
+        return unchecked;
+    }"""
+
+    async def _clear_all_selections(fr, box):
+        """Scan quickly from top to bottom to ensure zero leftover checkboxes are ticked."""
+        try:
+            await fr.evaluate("""() => {
+                if (window.$ && $('#facilitytblcontainer').length) {
+                    try { $('#facilitytblcontainer').jqxGrid('clearselection'); } catch (e) {}
+                }
+            }""")
+        except Exception:
+            pass
+
+        await _scroll_grid_to(page, fr, box, 0)
+        await asyncio.sleep(0.35)
+        for step in range(25):
+            await fr.evaluate(UNCHECK_OTHERS_JS, want_key)
+            state = await fr.evaluate(INSPECT_VIEW_JS, want_key)
+            # Also check if we reached the bottom
+            await _scroll_grid_to(page, fr, box, (step + 1) * 450)
+            await asyncio.sleep(0.18)
+            new_state = await fr.evaluate(INSPECT_VIEW_JS, want_key)
+            if step > 4 and new_state == state:
+                break
 
     async def _attempt_select(reload_first=False):
         if reload_first:
-            await notify("🔄 Reloading 'Facility Parameters' to reset the grid and retry...")
+            await notify("🔄 Reloading 'Facility Parameters' tab to reset all checkboxes cleanly...")
             _, fac_tab = await find_in_frames(page, FACILITY_TAB, timeout=20)
             if fac_tab:
                 await click(fac_tab)
                 await asyncio.sleep(3.5)
                 await wait_loading_dialog_gone(page, notify, appear_timeout=2.0, disappear_timeout=45)
 
-        # Wait 3 seconds before selecting the parameter so the grid is completely settled
         await notify(f"⏳ Waiting 3s before selecting '{target_name}'...")
         await asyncio.sleep(3.0)
 
@@ -2751,88 +2832,107 @@ async def reset_and_mark_single_param(page, target_name, notify):
 
         content = await fr.query_selector("#contentfacilitytblcontainer")
         box = await content.bounding_box() if content else None
-        target_row_idx = LAST_GRID_ROW_INDEX.get(want_key)
 
-        async def _try_mark_in_current_view():
-            """Uncheck any other visible checked rows, and if `want_key` is visible, center it and tick it."""
-            found_status = None
-            for row in await fr.query_selector_all(GRID_ROW_SEL):
-                lab = await row.query_selector('div[columnindex="3"] label')
-                if not lab:
-                    continue
-                key = norm_name((await lab.get_attribute("actualtagname")) or (await lab.inner_text()))
-                r_idx_attr = await lab.get_attribute("rowindex")
-                r_idx = int(r_idx_attr) if (r_idx_attr and r_idx_attr.isdigit()) else target_row_idx
-                if r_idx is not None:
-                    LAST_GRID_ROW_INDEX[key] = r_idx
+        # If we didn't just reload the tab, sweep and uncheck any previously checked rows
+        if not reload_first:
+            await _clear_all_selections(fr, box)
 
-                cb = await row.query_selector('div[columnindex="1"] .jqx-checkbox')
-                if not cb:
-                    if key == want_key:
-                        found_status = "no checkbox"
-                    continue
+        # Scroll back to top and step down in controlled 220px increments until target_name is in the safe viewport
+        await _scroll_grid_to(page, fr, box, 0)
+        await asyncio.sleep(0.4)
 
-                is_checked = await _cb_checked(cb)
-                if key == want_key:
-                    # Center the row in the viewport first so both the click and screenshot see it clearly
-                    await _scroll_row_into_center(fr, row, r_idx)
-                    # Re-query the checkbox after scrolling in case jqxGrid re-rendered the row DOM
-                    for r2 in await fr.query_selector_all(GRID_ROW_SEL):
-                        lab2 = await r2.query_selector('div[columnindex="3"] label')
-                        if not lab2:
-                            continue
-                        k2 = norm_name((await lab2.get_attribute("actualtagname")) or (await lab2.inner_text()))
-                        if k2 == want_key:
-                            cb = await r2.query_selector('div[columnindex="1"] .jqx-checkbox') or cb
-                            break
+        current_scroll_y = 0
+        for step in range(45):
+            # Always uncheck any wrong checked box we pass along the way
+            wrong_unchecked = await fr.evaluate(UNCHECK_OTHERS_JS, want_key)
+            if wrong_unchecked:
+                await notify(f"🧹 Unchecked wrong parameter(s): {', '.join(wrong_unchecked)}")
+                await asyncio.sleep(0.3)
 
-                    if not await _cb_checked(cb):
-                        await click(cb)
-                        await asyncio.sleep(0.8)
-                    found_status = "marked" if await _cb_checked(cb) else "clicked"
-                elif is_checked:
-                    await click(cb)
-                    await asyncio.sleep(0.4)
-            return found_status
+            view = await fr.evaluate(INSPECT_VIEW_JS, want_key)
+            t_info = view.get("targetInfo")
 
-        # 1. If we know the parameter's rowindex, scroll directly to it first so it is on screen
-        if target_row_idx is not None:
-            target_y = max(0, (target_row_idx - 3) * 28)
-            await _scroll_grid_to(page, fr, box, target_y)
-            await asyncio.sleep(0.8)
-            status = await _try_mark_in_current_view()
+            if t_info:
+                # If the row is too close to the bottom or top edge of the grid, nudge scroll to center it
+                if not t_info["inSafeView"]:
+                    desired_rel_top = 110  # ~4 rows below the grid header
+                    delta = t_info["relTop"] - desired_rel_top
+                    current_scroll_y = max(0, int(current_scroll_y + delta))
+                    await _scroll_grid_to(page, fr, box, current_scroll_y)
+                    await asyncio.sleep(0.5)
+                    view = await fr.evaluate(INSPECT_VIEW_JS, want_key)
+                    t_info = view.get("targetInfo")
+
+                if t_info:
+                    # Click the exact coordinates of the checkbox for `want_key` (or skip click if already checked)
+                    if not t_info["checked"]:
+                        await page.mouse.click(t_info["x"], t_info["y"])
+                        await asyncio.sleep(0.7)
+
+                    # Re-verify in DOM; if mouse click didn't toggle it, use atomic JS click on the exact matched row
+                    verify1 = await fr.evaluate(INSPECT_VIEW_JS, want_key)
+                    t_after = verify1.get("targetInfo")
+                    if t_after and not t_after["checked"]:
+                        await fr.evaluate("""(wantKey) => {
+                            const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                            for (const row of document.querySelectorAll('div[role="row"][id^="row"][id$="facilitytblcontainer"]')) {
+                                const lab = row.querySelector('div[columnindex="3"] label');
+                                if (!lab) continue;
+                                const key = norm(lab.getAttribute('actualtagname') || lab.innerText || '');
+                                if (key === wantKey) {
+                                    const cb = row.querySelector('div[columnindex="1"] .jqx-checkbox-default')
+                                            || row.querySelector('div[columnindex="1"] .jqx-checkbox');
+                                    if (cb) cb.click();
+                                    break;
+                                }
+                            }
+                        }""", want_key)
+                        await asyncio.sleep(0.7)
+
+                    # Clean up any accidental neighbor check and run final double-check
+                    await fr.evaluate(UNCHECK_OTHERS_JS, want_key)
+                    await asyncio.sleep(0.3)
+
+                    final_view = await fr.evaluate(INSPECT_VIEW_JS, want_key)
+                    final_target = final_view.get("targetInfo")
+                    checked_list = final_view.get("checkedNames") or []
+
+                    only_target_checked = (
+                        final_target is not None
+                        and final_target["checked"]
+                        and len(checked_list) == 1
+                        and checked_list[0]["key"] == want_key
+                    )
+                    if only_target_checked:
+                        await notify(
+                            f"✅ Double-checked: '{final_target['name']}' is confirmed marked (and centered on screen)."
+                        )
+                        return "marked"
+                    else:
+                        checked_str = ", ".join(c["name"] for c in checked_list) or "none"
+                        await notify(
+                            f"⚠️ Double-check mismatch: expected '{target_name}', but checked=[{checked_str}]. Retrying..."
+                        )
+                        return "mismatch"
+
+            # Advance down by 220px (~8 rows) so we never skip over a row
+            current_scroll_y += 220
+            await _scroll_grid_to(page, fr, box, current_scroll_y)
+            await asyncio.sleep(0.3)
+
+        return "not found"
+
+    # Attempt 1: Reload Facility Parameters first so the grid starts 100% clean with 0 checked boxes, then select & verify
+    for attempt in range(1, 3):
+        try:
+            status = await _attempt_select(reload_first=True)
             if status == "marked":
-                await asyncio.sleep(0.5)  # brief pause so the checkmark is rendered for the screenshot
                 return status
+            await notify(f"⚠️ Verification attempt {attempt}/2 returned '{status}'. Retrying with fresh reload...")
+        except Exception as e:
+            await notify(f"⚠️ Error on selection attempt {attempt}/2 ({str(e)[:120]}). Retrying...")
 
-        # 2. Scan through the grid from the top until the parameter is found, centered, and marked
-        result_status = "not found"
-
-        async def visit(frame, _rows_data):
-            nonlocal result_status
-            st = await _try_mark_in_current_view()
-            if st:
-                result_status = st
-            return result_status in ("marked", "no checkbox")
-
-        await scan_grid(page, visit)
-        await asyncio.sleep(0.5)
-        return result_status
-
-    # First attempt: select directly (with 3s wait and scroll-into-view)
-    try:
-        status = await _attempt_select(reload_first=False)
-        if status == "marked":
-            await notify(f"☑️ {target_name}: {status}")
-            return status
-        await notify(f"⚠️ Initial selection returned '{status}'. Reloading Facility Parameters and retrying...")
-    except Exception as e:
-        await notify(f"⚠️ Error selecting '{target_name}' ({str(e)[:120]}). Reloading Facility Parameters and retrying...")
-
-    # Second attempt (Fallback): reload Facility Parameters tab to clear/reset everything and reselect
-    status = await _attempt_select(reload_first=True)
-    await notify(f"☑️ {target_name}: {status}")
-    return status
+    raise Exception(f"Could not verify that '{target_name}' was accurately marked after 2 full attempts.")
 
 async def run_demand_scan(bot, chat_id, well, page, notify, debug_path):
     """Click Demand Scan -> click Ok if confirmation appears, or skip if loading bar appears directly ->
