@@ -2725,12 +2725,12 @@ async def wait_loading_dialog_gone(page, notify, appear_timeout=6, disappear_tim
 
 
 async def reset_and_mark_single_param(page, target_name, notify, well_name="", login_ui=None):
-    """Bulletproof single-parameter selector for virtualized jqxGrid:
+    """Bulletproof single-parameter selector for virtualized jqxGrid (handles duplicate alarm rows & duplicate row IDs):
     1. Confirms via breadcrumb that we are still on `well_name` (re-opens well if needed).
-    2. Never clicks FACILITY_TAB unnecessarily (which can reset the active well).
+    2. Tags each rendered row with a unique `data-bot-uid` (since jqxGrid can duplicate row.id).
     3. Scrolls in controlled steps using jqxGrid scrolloffset.
-    4. Uses Playwright's frame-aware ElementHandle.click() + jqxCheckbox API to toggle checkboxes.
-    5. Double-checks that ONLY `target_name` is checked and visible on screen before screenshot."""
+    4. Ticks ONLY the first visible instance of `target_name` and unchecks any duplicate row or other parameter.
+    5. Confirms `target_name` is checked and no other parameter is checked."""
     want_key = norm_name(target_name)
 
     INSPECT_VIEW_JS = """(wantKey) => {
@@ -2742,17 +2742,20 @@ async def reset_and_mark_single_param(page, target_name, notify, well_name="", l
         const checkedNames = [];
         let targetInfo = null;
 
-        for (const row of rows) {
+        rows.forEach((row, idx) => {
+            const uid = String(idx);
+            row.setAttribute('data-bot-uid', uid);
+
             const lab = row.querySelector('div[columnindex="3"] label');
-            if (!lab) continue;
+            if (!lab) return;
             const rawName = (lab.getAttribute('actualtagname') || lab.innerText || '').trim();
             const key = norm(rawName);
             const cb = row.querySelector('div[columnindex="1"] .jqx-checkbox');
-            if (!cb) continue;
+            if (!cb) return;
 
             const isChecked = /checkbox-check-checked/i.test(cb.innerHTML) || cb.getAttribute('aria-checked') === 'true';
             if (isChecked) {
-                checkedNames.push({ name: rawName, key: key, rowId: row.id });
+                checkedNames.push({ name: rawName, key: key, uid: uid, rowId: row.id });
             }
 
             if (key === wantKey) {
@@ -2764,17 +2767,21 @@ async def reset_and_mark_single_param(page, target_name, notify, well_name="", l
                     relTop >= 25 &&
                     relBottom <= (cRect.height - 15)
                 );
-                targetInfo = {
-                    rowId: row.id,
-                    name: rawName,
-                    key: key,
-                    checked: isChecked,
-                    relTop: relTop,
-                    containerHeight: cRect.height,
-                    inSafeView: inSafeView,
-                };
+                // Prefer the instance that is already inside the safe view (or the first one found)
+                if (!targetInfo || (!targetInfo.inSafeView && inSafeView)) {
+                    targetInfo = {
+                        uid: uid,
+                        rowId: row.id,
+                        name: rawName,
+                        key: key,
+                        checked: isChecked,
+                        relTop: relTop,
+                        containerHeight: cRect.height,
+                        inSafeView: inSafeView,
+                    };
+                }
             }
-        }
+        });
         return { checkedNames, targetInfo };
     }"""
 
@@ -2791,14 +2798,12 @@ async def reset_and_mark_single_param(page, target_name, notify, well_name="", l
             await ensure_tab_open(page, GRID_TAB, "Grid View", notify)
             await asyncio.sleep(2.0)
 
-    async def _toggle_row_checkbox(fr, row_id: str, want_key_check: str, desired_checked: bool):
-        """Click a checkbox inside iframe `fr` using Playwright's native ElementHandle.click()
-        (which properly accounts for iframe offsets) with jqxCheckbox JS fallback."""
-        row_el = await fr.query_selector(f"div#{row_id}")
+    async def _toggle_row_checkbox_by_uid(fr, uid: str, want_key_check: str, desired_checked: bool):
+        """Click a checkbox inside iframe `fr` using its unique `data-bot-uid` attribute."""
+        row_el = await fr.query_selector(f'div[role="row"][data-bot-uid="{uid}"]')
         if not row_el:
             return False
 
-        # Verify the row still holds the expected parameter before clicking
         lab = await row_el.query_selector('div[columnindex="3"] label')
         if not lab:
             return False
@@ -2814,17 +2819,17 @@ async def reset_and_mark_single_param(page, target_name, notify, well_name="", l
         if currently_checked == desired_checked:
             return True
 
-        # 1. Primary: Playwright native ElementHandle.click() (frame-aware real mouse event)
+        # 1. Primary: Playwright native ElementHandle.click()
         try:
             await cb.click(timeout=3000, force=True)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.45)
         except Exception:
             pass
 
         if (await _cb_checked(cb)) == desired_checked:
             return True
 
-        # 2. Secondary: jqxCheckbox native API + mousedown/mouseup/click dispatch
+        # 2. Secondary: jqxCheckbox API + mouse event dispatch
         await cb.evaluate(
             """(el, want) => {
                 try {
@@ -2834,22 +2839,26 @@ async def reset_and_mark_single_param(page, target_name, notify, well_name="", l
                     }
                 } catch (e) {}
                 const target = el.querySelector('.jqx-checkbox-default') || el;
-                for (const evType of [' pointerdown', 'mousedown', 'mouseup', 'click']) {
-                    target.dispatchEvent(new MouseEvent(evType.trim(), { bubbles: true, cancelable: true, view: window }));
+                for (const evType of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
+                    target.dispatchEvent(new MouseEvent(evType, { bubbles: true, cancelable: true, view: window }));
                 }
             }""",
             desired_checked,
         )
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.45)
         return (await _cb_checked(cb)) == desired_checked
 
-    async def _uncheck_wrong_visible_rows(fr):
-        """Uncheck any visible row in the current viewport whose key != want_key."""
+    async def _uncheck_wrong_visible_rows(fr, keep_uid=None):
+        """Uncheck any visible row whose key != want_key, OR duplicate rows of want_key if keep_uid is specified."""
         view = await fr.evaluate(INSPECT_VIEW_JS, want_key)
         for item in view.get("checkedNames") or []:
             if item["key"] != want_key:
-                await _toggle_row_checkbox(fr, item["rowId"], item["key"], desired_checked=False)
+                await _toggle_row_checkbox_by_uid(fr, item["uid"], item["key"], desired_checked=False)
                 await notify(f"🧹 Unchecked other parameter: {item['name']}")
+                await asyncio.sleep(0.25)
+            elif keep_uid is not None and item["uid"] != keep_uid:
+                # If a duplicate row of the SAME parameter is also checked, try unchecking the duplicate
+                await _toggle_row_checkbox_by_uid(fr, item["uid"], item["key"], desired_checked=False)
                 await asyncio.sleep(0.25)
 
     async def _attempt_select(sweep_uncheck_all=False):
@@ -2860,7 +2869,6 @@ async def reset_and_mark_single_param(page, target_name, notify, well_name="", l
 
         fr = await grid_frame(page)
         if not fr:
-            # Wait up to 10s for the grid frame to appear
             for _ in range(20):
                 fr = await grid_frame(page)
                 if fr:
@@ -2872,20 +2880,19 @@ async def reset_and_mark_single_param(page, target_name, notify, well_name="", l
         content = await fr.query_selector("#contentfacilitytblcontainer")
         box = await content.bounding_box() if content else None
 
-        # Optional full sweep from top to bottom to uncheck any old ticked parameters
         if sweep_uncheck_all:
             await _scroll_grid_to(page, fr, box, 0)
             await asyncio.sleep(0.35)
             for s in range(25):
-                await _uncheck_wrong_visible_rows(fr)
-                before_v = await fr.evaluate(INSPECT_VIEW_JS, want_key)
+                view_s = await fr.evaluate(INSPECT_VIEW_JS, want_key)
+                for item in view_s.get("checkedNames") or []:
+                    await _toggle_row_checkbox_by_uid(fr, item["uid"], item["key"], desired_checked=False)
                 await _scroll_grid_to(page, fr, box, (s + 1) * 450)
                 await asyncio.sleep(0.2)
-                after_v = await fr.evaluate(INSPECT_VIEW_JS, want_key)
-                if s > 3 and after_v == before_v:
+                after_s = await fr.evaluate(INSPECT_VIEW_JS, want_key)
+                if s > 3 and after_s == view_s:
                     break
 
-        # Scroll to top and step down in 220px increments to find, center, and tick `target_name`
         await _scroll_grid_to(page, fr, box, 0)
         await asyncio.sleep(0.4)
 
@@ -2897,7 +2904,6 @@ async def reset_and_mark_single_param(page, target_name, notify, well_name="", l
             t_info = view.get("targetInfo")
 
             if t_info:
-                # Center the row in the grid viewport if it's near the top/bottom edge
                 if not t_info["inSafeView"]:
                     desired_rel_top = 110
                     delta = t_info["relTop"] - desired_rel_top
@@ -2908,22 +2914,22 @@ async def reset_and_mark_single_param(page, target_name, notify, well_name="", l
                     t_info = view.get("targetInfo")
 
                 if t_info:
-                    # Tick the target row using Playwright's frame-aware ElementHandle.click()
-                    await _toggle_row_checkbox(fr, t_info["rowId"], want_key, desired_checked=True)
+                    await _toggle_row_checkbox_by_uid(fr, t_info["uid"], want_key, desired_checked=True)
                     await asyncio.sleep(0.4)
 
-                    # Ensure no neighbor row is checked
-                    await _uncheck_wrong_visible_rows(fr)
+                    # Uncheck any other parameter (and any duplicate row if they aren't linked)
+                    await _uncheck_wrong_visible_rows(fr, keep_uid=t_info["uid"])
 
                     final_view = await fr.evaluate(INSPECT_VIEW_JS, want_key)
                     final_target = final_view.get("targetInfo")
                     checked_list = final_view.get("checkedNames") or []
 
+                    # Succeed as long as target_name is checked and EVERY checked row is target_name!
                     only_target_checked = (
                         final_target is not None
                         and final_target["checked"]
-                        and len(checked_list) == 1
-                        and checked_list[0]["key"] == want_key
+                        and len(checked_list) >= 1
+                        and all(c["key"] == want_key for c in checked_list)
                     )
                     if only_target_checked:
                         await notify(
@@ -2943,7 +2949,6 @@ async def reset_and_mark_single_param(page, target_name, notify, well_name="", l
 
         return "not found"
 
-    # Attempt 1: Uncheck any visible boxes and select directly without reloading tabs
     for attempt in range(1, 3):
         try:
             status = await _attempt_select(sweep_uncheck_all=(attempt > 1))
